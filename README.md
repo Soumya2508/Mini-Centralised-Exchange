@@ -12,14 +12,14 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 |-------|------|-----|
 | **Stage 0** ✅ | Fully-transactional Postgres baseline | The honest starting point — can't claim I need complexity until I've built the simple thing and shown where it breaks |
 | **Stage 0.5** ✅ | Load harness (k6) | Must produce my own numbers, not assert textbook ones |
-| **Stage 1** | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
+| **Stage 1** ✅ | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
 | **Stage 2** | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
 | **Stage 3** | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
 | **Stage 4** | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
 
-### Current status: **Stage 0 hardened; Stage 0.5 measured**
+### Current status: **Stage 1 complete — wall profiled, not yet optimised**
 
-Stage 0 is a correct transactional baseline with a committed invariant harness. Stage 0.5 has produced a measured baseline: the ACID path plateaus at **~135 orders/sec**. Nothing has been tuned or optimised — Stages 1 → 4 are not started.
+Stage 0 is a correct transactional baseline with a committed invariant harness. Stage 1 profiled the wall: after adding the missing index, the ACID path plateaus at **~83 orders/sec**, and the dominant cost is **row-lock contention on the head-of-book row** (54% of backend samples), not fsync (0.15%). Stages 2 → 4 are not started, and Stage 2 is not yet licensed — see [DEVLOG.md](DEVLOG.md).
 
 **What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no in-memory matching engine. Durability in Stage 0 is whatever Postgres itself provides via its own ACID guarantees — nothing custom has been built on top. The Stage 0.5 numbers below are a *baseline measurement*, not an optimisation result: nothing has been tuned, and the dominant cost has not yet been profiled.
 
@@ -168,7 +168,7 @@ Load generated with k6 against `POST /order`, using a generated seed of 200 fund
 | 50 | 133.23 | 342.09ms | 576.92ms | 690.98ms | 0.00% | 100% |
 | 100 | 140.41 | 675.72ms | 888.67ms | 1.04s | 0.00% | 100% |
 
-**Throughput plateaus at ~135 ord/s from 5 VUs onward.** Going from 5 to 100 concurrent clients bought no extra throughput while p50 latency grew ~21x. Past ~5 concurrent clients, requests queue rather than execute.
+**Throughput plateaus from 5 VUs onward.** (Stage 1 re-measurement put the plateau at ~83 ord/s on the same code; run-to-run variance is ~10% and this 135 figure did not reproduce — treat Stage 1's numbers as authoritative.) Going from 5 to 100 concurrent clients bought no extra throughput while p50 latency grew ~21x. Past ~5 concurrent clients, requests queue rather than execute.
 
 Zero errors and **zero deadlocks** at every level — the deterministic lock ordering holds under sustained load. 15,378 trades committed across the sweep with `negative_balances = 0` afterwards.
 
@@ -326,7 +326,7 @@ A matching engine for one instrument is fundamentally **single-writer** — all 
 
 - [x] **Stage 0** — Transactional Postgres baseline, hardened, with committed invariant harness
 - [x] **Stage 0.5** — Load harness (k6) + measured baseline (no tuning)
-- [ ] **Stage 1** — Baseline measurement under load; profile the wall
+- [x] **Stage 1** — Profiled the wall: index separated, dominant cost = row-lock contention
 - [ ] **Stage 2** — In-memory matching (single-threaded, lock-free)
 - [ ] **Stage 3** — Custom WAL (group commit, CRC32 torn-write protection, crash recovery)
 - [ ] **Stage 4** — Async projection to Postgres read-model (CQRS)

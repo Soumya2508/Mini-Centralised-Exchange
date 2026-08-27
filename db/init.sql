@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS trades (
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
+
+-- Index supporting the matching query's predicate and ordering.
+-- Partial: only open/partial orders are ever matchable, so filled
+-- orders (the vast majority as the table grows) stay out of the index.
+-- Added in Stage 1 after EXPLAIN showed a Seq Scan removing 11,206
+-- rows per match on a 12k-row table.
+CREATE INDEX IF NOT EXISTS idx_orders_match
+    ON orders (symbol, side, price, id)
+    WHERE status IN ('open','partial');
+
 -- 2. Seed data ------------------------------------------------
 
 -- Five test users
