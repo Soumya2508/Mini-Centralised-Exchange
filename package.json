@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "npx tsx src/server.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx src/test/invariants.ts"
   },
   "keywords": [],
   "author": "",
