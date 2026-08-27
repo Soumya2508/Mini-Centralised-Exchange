@@ -235,3 +235,83 @@ Raw k6 summary at VUs=100:
 **Not done (deliberate):** no tuning of any kind. Pool size untouched, `synchronous_commit` untouched, no index added, no in-memory move. Stage 0.5 only measures; optimisation must be licensed by Stage 1 profiling.
 
 **Next:** Stage 1 — profile WHICH cost dominates at the ~135 ord/s wall (fsync vs row-lock contention vs the unindexed match scan vs round-trips).
+
+---
+
+## [2026-08-27 22:20] — Stage 1: true wall profiling
+
+**Index effect:** before **~87 ord/s peak, decaying to 68** → after index on `(symbol, side, price, id) WHERE status IN ('open','partial')` **~83 ord/s peak, holding 82-83**. The scan was **~0% of the ceiling** but ~100% of the *degradation*.
+
+The index did **not** raise peak throughput. What it removed was the decay: without it throughput fell as the `orders` table grew, because every match re-scanned the whole table.
+
+Identical sweeps, both from a fresh DB + `seed:load`, 20s per level, 10s warm-up discarded:
+
+| VUs | no index (ord/s) | p95 | with index (ord/s) | p95 |
+|-----|-----------------|-----|-------------------|-----|
+| 1 | 56.18 | 27.64ms | 60.19 | 27.16ms |
+| 5 | 85.00 | 126.52ms | 83.56 | 86.07ms |
+| 10 | 86.96 | 371.46ms | 81.32 | 190.17ms |
+| 25 | 78.90 | 424.77ms | 82.51 | 394.58ms |
+| 50 | 68.44 | 935.03ms | 82.98 | 754.42ms |
+| 100 | 68.09 | 1.91s | 72.42 | 2.15s |
+
+Direct proof the scan caused the decay — same VUs=10, larger table:
+
+```
+5,000 rows  -> 86.96 ord/s
+11,760 rows -> 60.83 ord/s     (-30% for ~2x the rows)
+```
+
+```
+EXPLAIN (ANALYZE, BUFFERS) ... ORDER BY price, id LIMIT 1;
+ Limit  (actual time=2.064..2.074 rows=1)
+   ->  Sort  Sort Key: price, id
+         ->  Seq Scan on orders  (actual time=0.053..1.789 rows=1781)
+               Rows Removed by Filter: 11206
+               Buffers: shared hit=146
+ Execution Time: 3.029 ms
+```
+
+After the index — same query, no sort, 46x faster:
+
+```
+ Limit  (actual time=0.037..0.038 rows=1)
+   ->  Index Scan using idx_orders_match on orders (actual time=0.036..0.036 rows=1)
+ Execution Time: 0.065 ms
+```
+
+**Dominant cost of remaining wall: ROW-LOCK CONTENTION.** Evidence — 60 samples of `pg_stat_activity` during a 25-VU run, 660 backend observations:
+
+```
+    306 active|Lock|tuple              46.4%   waiting for a row lock
+    193 idle|Client|ClientRead         29.2%   idle pool connection
+     75 active|RUNNING|-               11.4%   actually executing
+     52 active|Lock|transactionid       7.9%   waiting on another txn to finish
+     27 idle in transaction|ClientRead  4.1%
+      1 active|IO|WALSync               0.15%  fsync
+```
+
+Lock waits (`Lock|tuple` + `Lock|transactionid`) = **54.2%** of all backend samples. Actually executing = 11.4%. fsync = **0.15%**.
+
+Corroborated by an alternating A/B on `synchronous_commit` (diagnostic only, reverted immediately):
+
+```
+pass1 synchronous_commit=on   tput=81.11/s  p95=439.62ms
+pass1 synchronous_commit=off  tput=94.65/s  p95=352.80ms
+pass2 synchronous_commit=on   tput=78.13/s  p95=420.46ms
+pass2 synchronous_commit=off  tput=87.57/s  p95=394.21ms
+```
+
+Mean on = 79.6 ord/s, mean off = 91.1 ord/s. **Turning off fsync entirely buys only ~14%.** It is a real cost but not the wall. `synchronous_commit` was reset to `on` and verified.
+
+Why this is expected rather than surprising: every load order is a BUY at one price against one book, so all takers contend for the **head-of-book row**. That row is a single serialisation point by construction — the single-writer property. Concurrency cannot help; a single client already achieves ~60 ord/s and 100 clients reach only ~72-83.
+
+**Pool tuning: not warranted, lock contention dominates.** The pool is not exhausted — ~3.2 of 10 connections were *idle* at any instant (29.2% of samples) while 25 VUs were in flight. Exhaustion would show all connections busy and zero idle. The connections that exist are blocked on row locks; adding more would only add more waiters on the same row. Pool config left untouched at its default (`max` unset = 10).
+
+**True measured wall (post-index):** **~83 ord/s peak**, flat from 5 to 50 VUs, p95 **86ms at 5 VUs** rising to **754ms at 50 VUs**.
+
+**Measurement caveats:** run-to-run variance at fixed load is ~10% (three consecutive VUs=25 runs: 73.2 / 67.6 / 75.0). Stage 0.5 reported ~135 ord/s peak; this Stage 1 baseline reproduced ~85 on the same code and seed, so that earlier figure is **not reliable** and should be read as "same order of magnitude" only. Absolute numbers here are a range, not a point. Client, API and Postgres all share one Windows host. Throughput still decays slowly with table size even with the index (index maintenance on insert, growing `trades`).
+
+**Not done (deliberate):** matching not moved in-memory, no WAL, no pool change, `synchronous_commit` reverted to default.
+
+**Licensing question for human:** the wall is row-lock contention on a single head-of-book row, at ~83 ord/s. Postgres row locking is doing exactly what it should. Removing fsync buys 14%; indexing bought stability but no ceiling. The remaining lever that addresses the *actual* dominant cost is removing the round-trip-per-lock model entirely — i.e. single-threaded in-memory matching where the "lock" is just being the only writer. **Does this measurement license Stage 2, or is ~83 ord/s adequate and the honest move to stop?** Human decides.
