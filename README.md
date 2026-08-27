@@ -11,17 +11,17 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 | Stage | What | Why |
 |-------|------|-----|
 | **Stage 0** ✅ | Fully-transactional Postgres baseline | The honest starting point — can't claim I need complexity until I've built the simple thing and shown where it breaks |
-| **Stage 0.5** | Load harness (k6) | Must produce my own numbers, not assert textbook ones |
+| **Stage 0.5** ✅ | Load harness (k6) | Must produce my own numbers, not assert textbook ones |
 | **Stage 1** | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
 | **Stage 2** | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
 | **Stage 3** | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
 | **Stage 4** | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
 
-### Current status: **Stage 0 complete and hardened**
+### Current status: **Stage 0 hardened; Stage 0.5 measured**
 
-Stage 0 is a correct transactional baseline with a committed invariant harness. **No performance claim is made yet** — no load test has been run. Stages 0.5 → 4 are not started.
+Stage 0 is a correct transactional baseline with a committed invariant harness. Stage 0.5 has produced a measured baseline: the ACID path plateaus at **~135 orders/sec**. Nothing has been tuned or optimised — Stages 1 → 4 are not started.
 
-**What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no in-memory matching engine, no benchmark numbers. Durability in Stage 0 is whatever Postgres itself provides via its own ACID guarantees — nothing custom has been built on top.
+**What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no in-memory matching engine. Durability in Stage 0 is whatever Postgres itself provides via its own ACID guarantees — nothing custom has been built on top. The Stage 0.5 numbers below are a *baseline measurement*, not an optimisation result: nothing has been tuned, and the dominant cost has not yet been profiled.
 
 ---
 
@@ -151,6 +151,36 @@ Her unfilled 5 rests. A later seller fills it:
  13 |       2 | sell |    90 |        5 |      5 | filled
 
 totals: SOL=250.00000000  USDC=50000.00000000   (unchanged)
+```
+
+---
+
+## Stage 0.5 — Measured baseline (no tuning)
+
+Load generated with k6 against `POST /order`, using a generated seed of 200 funded users and a 2,000-order resting sell book (`db/seed-load.sql`, `loadtest/order-load.js`). Orders are constructed to genuinely **match and commit** — `match_rate` was **100% at every level**, so these numbers measure the real transactional path, not rejection speed.
+
+| VUs | throughput (ord/s) | p50 | p95 | p99 | error% | match% |
+|-----|-------------------|-----|-----|-----|--------|--------|
+| 1 | 56.95 | 16.04ms | 33.19ms | 42.54ms | 0.00% | 100% |
+| 5 | 135.05 | 31.30ms | 67.59ms | 174.14ms | 0.00% | 100% |
+| 10 | 138.17 | 28.71ms | 198.26ms | 865.44ms | 0.00% | 100% |
+| 25 | 133.21 | 170.41ms | 284.74ms | 360.68ms | 0.00% | 100% |
+| 50 | 133.23 | 342.09ms | 576.92ms | 690.98ms | 0.00% | 100% |
+| 100 | 140.41 | 675.72ms | 888.67ms | 1.04s | 0.00% | 100% |
+
+**Throughput plateaus at ~135 ord/s from 5 VUs onward.** Going from 5 to 100 concurrent clients bought no extra throughput while p50 latency grew ~21x. Past ~5 concurrent clients, requests queue rather than execute.
+
+Zero errors and **zero deadlocks** at every level — the deterministic lock ordering holds under sustained load. 15,378 trades committed across the sweep with `negative_balances = 0` afterwards.
+
+**No conclusion is drawn yet about *why* the wall is there.** Candidate causes — fsync-per-commit, row-lock contention on the head of the book, the unindexed match predicate on a table growing by one row per request, or client/server round-trips — have not been separated. That profiling is Stage 1, and it is what licenses any optimisation.
+
+Reproduce:
+
+```bash
+docker compose down -v && docker compose up -d
+npm run seed:load
+npm run dev
+docker run --rm -i --add-host=host.docker.internal:host-gateway   -e BASE_URL=http://host.docker.internal:3000 -e VUS=25 -e DURATION=20s   grafana/k6:latest run - < loadtest/order-load.js
 ```
 
 ---
@@ -295,7 +325,7 @@ A matching engine for one instrument is fundamentally **single-writer** — all 
 ## Roadmap
 
 - [x] **Stage 0** — Transactional Postgres baseline, hardened, with committed invariant harness
-- [ ] **Stage 0.5** — Load harness (k6) for benchmark-driven development
+- [x] **Stage 0.5** — Load harness (k6) + measured baseline (no tuning)
 - [ ] **Stage 1** — Baseline measurement under load; profile the wall
 - [ ] **Stage 2** — In-memory matching (single-threaded, lock-free)
 - [ ] **Stage 3** — Custom WAL (group commit, CRC32 torn-write protection, crash recovery)

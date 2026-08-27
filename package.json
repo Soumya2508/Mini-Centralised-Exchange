@@ -4,7 +4,8 @@
   "main": "index.js",
   "scripts": {
     "dev": "npx tsx src/server.ts",
-    "test": "tsx src/test/invariants.ts"
+    "test": "tsx src/test/invariants.ts",
+    "seed:load": "docker exec -i exchange_postgres psql -U exchange -d db_exchange -f /dev/stdin < db/seed-load.sql"
   },
   "keywords": [],
   "author": "",

@@ -171,3 +171,67 @@ EXIT CODE: 0
 The original Stage 0 was reported as complete with four passing tests. Three of those claims were fine; one was a test that passed for the wrong reason, and two serious defects sat in code that no test exercised. Documentation of a test is not verification of a test. Every claim in the README is now output from code in the repo, reproducible from a clean `docker compose down -v`.
 
 **Next:** decide whether to lift the Bug 5 scope cut; then Stage 0.5 (load harness).
+
+---
+
+## [2026-08-27 17:40] — Stage 0.5 load harness + baseline measurement
+
+**Tool:** k6 v2.2.0, run from the official `grafana/k6` Docker image (no local install; `winget` had no working package). Script: `loadtest/order-load.js`. Seed: `db/seed-load.sql`, wired to `npm run seed:load`.
+
+**Seed:** 200 load users (`load_u1`..`load_u200`), each funded in **both** assets — 10,000,000 USDC and 100,000 SOL. Resting book of 2,000 generated sell orders (10 per user, 50 SOL each @ 100) = 100,000 SOL of liquidity. Generated with `generate_series`, idempotent, reproducible from a fresh DB. Confirmed on a clean run:
+
+```
+ load_users | funded_balance_rows | resting_sells |  sol_liquidity
+        200 |                 400 |          2003 | 100016.00000000
+```
+
+(2,003 not 2,000 — the three `init.sql` demo sells are still present.)
+
+**Path exercised:** `match_rate = 100.00%` at every level. Every request committed a real trade — 15,378 trades written across the sweep. This measures the full transactional path (lock → match → move funds → commit), **not** rejection speed. Liquidity was never exhausted: 84,638 SOL still resting at the end. Post-run integrity: `negative_balances = 0`.
+
+**Baseline results (fresh DB, post-deadlock-fix, 20s per level):**
+
+| VUs | throughput (ord/s) | p50 | p95 | p99 | error% | match% |
+|-----|-------------------|-----|-----|-----|--------|--------|
+| 1 | 56.95 | 16.04ms | 33.19ms | 42.54ms | 0.00% | 100% |
+| 5 | 135.05 | 31.30ms | 67.59ms | 174.14ms | 0.00% | 100% |
+| 10 | 138.17 | 28.71ms | 198.26ms | 865.44ms | 0.00% | 100% |
+| 25 | 133.21 | 170.41ms | 284.74ms | 360.68ms | 0.00% | 100% |
+| 50 | 133.23 | 342.09ms | 576.92ms | 690.98ms | 0.00% | 100% |
+| 100 | 140.41 | 675.72ms | 888.67ms | 1.04s | 0.00% | 100% |
+
+Raw k6 summary at VUs=100:
+
+```
+  █ TOTAL RESULTS
+
+    CUSTOM
+    commit_latency.................: avg=699.69ms min=33.38ms med=675.72ms p(95)=888.67ms p(99)=1.04s max=2.82s
+    match_rate.....................: 100.00% 2901 out of 2901
+    orders_filled..................: 2901    140.414073/s
+
+    HTTP
+    http_req_duration..............: avg=699.69ms min=33.38ms med=675.72ms p(95)=888.67ms p(99)=1.04s max=2.82s
+      { expected_response:true }...: avg=699.69ms min=33.38ms med=675.72ms p(95)=888.67ms p(99)=1.04s max=2.82s
+    http_req_failed................: 0.00%   0 out of 2901
+    http_reqs......................: 2901    140.414073/s
+
+    EXECUTION
+    iteration_duration.............: avg=700.73ms min=57.16ms med=675.92ms p(95)=888.9ms  p(99)=1.04s max=2.82s
+    iterations.....................: 2901    140.414073/s
+    vus............................: 100     min=100          max=100
+```
+
+**Throughput plateau observed at:** ~**135 ord/s**, reached by **5 VUs** and flat from there to 100 VUs (135 → 138 → 133 → 133 → 140). Adding 20× the concurrency bought **zero** extra throughput while p50 latency grew ~21× (31ms → 676ms) and p95 ~13× (68ms → 889ms). That is textbook saturation: past 5 concurrent clients, requests queue rather than execute. **This is the wall.** A single client already gets 57 ord/s, so the ceiling is roughly 2.4× one client's rate.
+
+**Notes / caveats affecting the numbers:**
+- **Zero deadlocks and zero errors at every level** — the Stage 0 deadlock fix holds under sustained concurrent load. Before that fix this workload would have been unusable.
+- All takers are BUYs at a single price against one book, so every request contends for the **head of the book** — the same resting-order row, one at a time. That is intrinsic to a single-symbol matching engine (the single-writer property this project claims), not an artifact of the harness.
+- The `orders` table grows by one row per request (~17k rows by the end) and there is **no index** on the match predicate (`symbol, side, status, price`). Part of the measured cost is therefore a growing sequential scan. Stage 1 must separate that from lock/commit cost before concluding anything.
+- p99 at 10 VUs (865ms, max 8.71s) is an outlier versus its neighbours — likely a first-touch/warm-up effect. Worth re-running before treating it as signal.
+- Occasional self-trades are possible (buyer randomly equals the head order's seller); they net to zero and are not prevented in Stage 0.
+- Measured on a 20-core Windows host with Postgres in Docker and the API on the host — client, server and DB share one machine, so absolute numbers are not server-grade.
+
+**Not done (deliberate):** no tuning of any kind. Pool size untouched, `synchronous_commit` untouched, no index added, no in-memory move. Stage 0.5 only measures; optimisation must be licensed by Stage 1 profiling.
+
+**Next:** Stage 1 — profile WHICH cost dominates at the ~135 ord/s wall (fsync vs row-lock contention vs the unindexed match scan vs round-trips).
