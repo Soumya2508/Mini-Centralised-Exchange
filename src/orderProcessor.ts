@@ -19,58 +19,36 @@ export interface TradeResult {
 }
 
 // ── Core transactional order processor ───────────────────────
-// This is the Stage 0 "honest baseline" — every order runs inside
-// a single Postgres transaction with row-level locking (FOR UPDATE).
+// Stage 0 "honest baseline" — every order runs inside ONE Postgres
+// transaction with row-level locking (FOR UPDATE).
 //
-// The seven writes, one atomic unit:
-//   1. Lock & read the incoming user's balance   (SELECT … FOR UPDATE)
-//   2. Lock & read the best matching resting order (SELECT … FOR UPDATE)
-//   3. Debit buyer's USDC
-//   4. Credit buyer's SOL
-//   5. Debit seller's SOL
-//   6. Credit seller's USDC
-//   7. Update resting order status + insert trade record
+// LOCK DISCIPLINE (load-bearing — do not reorder):
+//   1. Lock the matching resting order row.
+//   2. Lock EVERY balance row the trade touches in a SINGLE query,
+//      ordered by (user_id, asset).
+// Postgres locks rows in the order the plan returns them, so both
+// sides of any concurrent pair acquire the same rows in the same
+// global order and queue instead of forming a cycle.
 //
-// Atomicity guarantee: if ANY step fails or the process crashes,
-// Postgres rolls back ALL changes — no half-executed orders, no
-// destroyed money.
+// The previous version locked "my own row first, then the other
+// party's rows". Two users trading into each other therefore grabbed
+// the same two rows in opposite order — a guaranteed deadlock cycle.
+//
+// Atomicity: if any step throws, Postgres rolls back everything.
 
 export async function processOrder(input: OrderInput): Promise<TradeResult> {
   const client = await pool.connect();
 
+  const baseAsset = input.symbol.split("_")[0];  // "SOL"
+  const quoteAsset = input.symbol.split("_")[1]; // "USDC"
+
   try {
     await client.query("BEGIN");
 
-    // ── Step 1: Lock the incoming user's relevant balance ─────
-    // FOR UPDATE = row-level lock; any concurrent transaction
-    // touching the same row must wait until we COMMIT or ROLLBACK.
-    const incomingAsset = input.side === "buy" ? "USDC" : input.symbol.split("_")[0]; // e.g. "SOL"
-    const balRes = await client.query(
-      `SELECT id, available FROM balances
-       WHERE user_id = $1 AND asset = $2
-       FOR UPDATE`,
-      [input.userId, incomingAsset]
-    );
-
-    if (balRes.rows.length === 0) {
-      throw new Error(`No ${incomingAsset} balance found for user ${input.userId}`);
-    }
-
-    const availableBalance = Number(balRes.rows[0].available);
-    const requiredAmount = input.side === "buy"
-      ? input.price * input.quantity   // buyer needs price × qty in quote asset (USDC)
-      : input.quantity;                // seller needs qty in base asset (SOL)
-
-    if (availableBalance < requiredAmount) {
-      throw new Error(
-        `Insufficient ${incomingAsset}: have ${availableBalance}, need ${requiredAmount}`
-      );
-    }
-
-    // ── Step 2: Find & lock the best matching resting order ──
+    // ── Step 1: Find & lock the best matching resting order ──
     // Price-time priority: best price first, then oldest order.
-    // A buy matches sells at or below the buy price.
-    // A sell matches buys at or above the sell price.
+    // A buy matches sells at or below its limit; a sell matches buys
+    // at or above its limit.
     const oppositeSide = input.side === "buy" ? "sell" : "buy";
     const priceCondition = input.side === "buy" ? "<=" : ">=";
     const priceSort = input.side === "buy" ? "ASC" : "DESC"; // best price for the taker
@@ -89,8 +67,10 @@ export async function processOrder(input: OrderInput): Promise<TradeResult> {
     );
 
     if (matchRes.rows.length === 0) {
-      // No match — in a real exchange we'd insert a resting order.
-      // For Stage 0 baseline we keep it simple: reject if no match.
+      // OPEN — Bug 5 (single-level match), pending a human scope decision:
+      // only ONE price level is ever consulted. A taker larger than the
+      // best level is not walked down the book; the remainder is dropped
+      // rather than resting. Left as-is deliberately.
       throw new Error("No matching resting order found");
     }
 
@@ -100,22 +80,55 @@ export async function processOrder(input: OrderInput): Promise<TradeResult> {
     const fillPrice = Number(resting.price); // trade executes at resting order's price
     const totalCost = fillQty * fillPrice;
 
-    // Determine buyer and seller user IDs
-    const buyerId  = input.side === "buy" ? input.userId : resting.user_id;
-    const sellerId = input.side === "sell" ? input.userId : resting.user_id;
+    const makerId  = Number(resting.user_id);
+    const buyerId  = input.side === "buy" ? input.userId : makerId;
+    const sellerId = input.side === "sell" ? input.userId : makerId;
 
-    // We need to lock the OTHER party's balances too
-    await client.query(
-      `SELECT id FROM balances
-       WHERE user_id = $1 AND asset IN ('USDC', $2)
+    // ── Step 2: Lock EVERY balance row this trade touches, at once ──
+    // Both parties, both assets, one query, ORDER BY user_id, asset.
+    const balRes = await client.query(
+      `SELECT user_id, asset, available FROM balances
+       WHERE user_id IN ($1, $2)
+         AND asset   IN ($3, $4)
+       ORDER BY user_id, asset
        FOR UPDATE`,
-      [input.side === "buy" ? resting.user_id : input.userId,
-       input.symbol.split("_")[0]]
+      [input.userId, makerId, baseAsset, quoteAsset]
     );
 
+    const findBalance = (userId: number, asset: string) =>
+      balRes.rows.find((r) => Number(r.user_id) === userId && r.asset === asset);
+
+    // ── Step 2a: Validate the TAKER ──────────────────────────
+    const takerAsset = input.side === "buy" ? quoteAsset : baseAsset;
+    const takerNeeds = input.side === "buy"
+      ? input.price * input.quantity   // conservative: the full order as submitted
+      : input.quantity;
+    const takerRow = findBalance(input.userId, takerAsset);
+
+    if (!takerRow) {
+      throw new Error(`No ${takerAsset} balance found for user ${input.userId}`);
+    }
+    const takerHas = Number(takerRow.available);
+    if (takerHas < takerNeeds) {
+      throw new Error(`Insufficient ${takerAsset}: have ${takerHas}, need ${takerNeeds}`);
+    }
+
+    // ── Step 2b: Validate the MAKER ──────────────────────────
+    // The resting order's owner must still hold what their order promises.
+    // Without this the fill drives their balance negative and the exchange
+    // invents assets out of nothing.
+    const makerAsset = input.side === "buy" ? baseAsset : quoteAsset;
+    const makerNeeds = input.side === "buy" ? fillQty : totalCost;
+    const makerRow = findBalance(makerId, makerAsset);
+    const makerHas = makerRow ? Number(makerRow.available) : 0;
+
+    if (makerHas < makerNeeds) {
+      throw new Error(
+        `Maker (user ${makerId}) has insufficient ${makerAsset}: have ${makerHas}, need ${makerNeeds}`
+      );
+    }
+
     // ── Steps 3-6: Move money ────────────────────────────────
-    const baseAsset = input.symbol.split("_")[0];  // "SOL"
-    const quoteAsset = input.symbol.split("_")[1]; // "USDC"
 
     // 3. Debit quote asset (USDC) from buyer
     await client.query(
@@ -154,12 +167,18 @@ export async function processOrder(input: OrderInput): Promise<TradeResult> {
       [newFilled, newStatus, resting.id]
     );
 
-    // ── Step 7b: Insert the incoming order (already filled) ──
+    // ── Step 7b: Insert the incoming order ───────────────────
+    // `quantity` records what the taker ACTUALLY asked for; `filled` records
+    // how much of it executed. The previous version stored fillQty as the
+    // quantity, which destroyed the real request and made every partial fill
+    // look like a complete one.
+    const incomingStatus = fillQty >= input.quantity ? "filled" : "partial";
     const incomingOrderRes = await client.query(
       `INSERT INTO orders (user_id, symbol, side, price, quantity, filled, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id`,
-      [input.userId, input.symbol, input.side, input.price, fillQty, fillQty, "filled"]
+      [input.userId, input.symbol, input.side, input.price,
+       input.quantity, fillQty, incomingStatus]
     );
     const incomingOrderId = incomingOrderRes.rows[0].id;
 
@@ -174,7 +193,7 @@ export async function processOrder(input: OrderInput): Promise<TradeResult> {
       [input.symbol, fillPrice, fillQty, buyerOrderId, sellerOrderId]
     );
 
-    // ── COMMIT — all 7+ writes become permanent atomically ───
+    // ── COMMIT — all writes become permanent atomically ──────
     await client.query("COMMIT");
 
     return {

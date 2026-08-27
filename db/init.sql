@@ -16,8 +16,8 @@ CREATE TABLE IF NOT EXISTS balances (
     id        SERIAL PRIMARY KEY,
     user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     asset     VARCHAR(10) NOT NULL,
-    available NUMERIC(20,8) NOT NULL DEFAULT 0,
-    locked    NUMERIC(20,8) NOT NULL DEFAULT 0,
+    available NUMERIC(20,8) NOT NULL DEFAULT 0 CHECK (available >= 0),
+    locked    NUMERIC(20,8) NOT NULL DEFAULT 0 CHECK (locked    >= 0),
     UNIQUE(user_id, asset)
 );
 
