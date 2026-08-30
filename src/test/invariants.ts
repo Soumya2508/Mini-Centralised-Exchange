@@ -26,7 +26,7 @@ import path from "node:path";
 import { pool } from "../db.js";
 import { processOrder as dbProcessOrder } from "../orderProcessor.js";
 import { MatchingEngine } from "../engine.js";
-import { Wal, GroupCommitWal } from "../wal.js";
+import { Wal, GroupCommitWal, replayDetailed, crc32 } from "../wal.js";
 
 const SYMBOL = "SOL_USDC";
 const ALICE = 1, BOB = 2, CAROL = 3, DAVE = 4, EVE = 5;
@@ -477,19 +477,93 @@ async function testGroupCommit(): Promise<void> {
   fs.rmSync(p, { force: true });
 }
 
+// ═══════════ F. Stage 3 Step 3 — torn-write protection ═══════════
+//
+// Frame: [4-byte length BE][JSON payload][4-byte CRC32 BE].
+// A crash mid-write must cost only the unacknowledged tail, never the
+// whole log — which is exactly what the bare jsonl format did.
+
+async function testTornWriteProtection(): Promise<void> {
+  console.log("\nF. STAGE 3 STEP 3 — torn-write protection (length + CRC32)");
+  const tmp = (n: string) => path.join(os.tmpdir(), `inv-torn-${process.pid}-${n}.log`);
+
+  /** Write N valid framed records and return the path + expected state. */
+  const buildLog = async (p: string, n: number) => {
+    fs.rmSync(p, { force: true });
+    const e = makeEngine();
+    const w = new GroupCommitWal(p, 1, { maxBatch: 4, maxDelayMs: 0, format: "framed" });
+    for (let i = 0; i < n; i++) await gcPlace(e, w, (i % 5) + 1, "buy", 110, 1);
+    w.close();
+    return e;
+  };
+
+  console.log("\n  (a) intact framed log round-trips");
+  let p = tmp("a");
+  let live = await buildLog(p, 12);
+  let res = replayDetailed(p);
+  assert("all records read back", res.records.length === 12, `read=${res.records.length}`);
+  assert("nothing discarded", res.discardedBytes === 0, `discarded=${res.discardedBytes}`);
+  assert("replayed state IDENTICAL to live", fingerprint(replayInto(p)) === fingerprint(live));
+
+  console.log("\n  (b) torn tail — truncated mid-record");
+  p = tmp("b");
+  live = await buildLog(p, 12);
+  const goodPrefix = fingerprint(replayInto(p));
+  // Simulate a crash partway through writing record 13.
+  fs.appendFileSync(p, Buffer.concat([
+    Buffer.from([0, 0, 0, 0x60]),                      // claims 96 payload bytes
+    Buffer.from('{"seq":13,"ts":1,"userId":3,"sym', "utf8"), // only 32 arrive
+  ]));
+  res = replayDetailed(p);
+  assert("torn tail did NOT abort recovery", res.records.length === 12, `read=${res.records.length}`);
+  assert("torn tail was discarded", res.discardedBytes === 36 && res.stoppedBecause === "short-payload",
+    `discarded=${res.discardedBytes} reason=${res.stoppedBecause}`);
+  assert("state after torn tail equals state before it", fingerprint(replayInto(p)) === goodPrefix);
+
+  console.log("\n  (c) truncated length field (fewer than 4 bytes left)");
+  p = tmp("c");
+  await buildLog(p, 8);
+  fs.appendFileSync(p, Buffer.from([0, 0]));   // half a length header
+  res = replayDetailed(p);
+  assert("recovered every complete record", res.records.length === 8, `read=${res.records.length}`);
+  assert("stump discarded", res.stoppedBecause === "short-length" && res.discardedBytes === 2,
+    `reason=${res.stoppedBecause} discarded=${res.discardedBytes}`);
+
+  console.log("\n  (d) CRC catches damage that the length field cannot");
+  p = tmp("d");
+  await buildLog(p, 10);
+  const buf = fs.readFileSync(p);
+  buf[buf.length - 12] ^= 0x01;               // flip a bit INSIDE the last payload
+  fs.writeFileSync(p, buf);                   // same length, damaged content
+  res = replayDetailed(p);
+  assert("damaged record rejected by CRC", res.records.length === 9, `read=${res.records.length}`);
+  assert("failure reported as crc-mismatch, not truncation", res.stoppedBecause === "crc-mismatch",
+    `reason=${res.stoppedBecause}`);
+  assert("content damage flagged as corruption, not a torn tail", res.midFileCorruption === true);
+
+  console.log("\n  (e) CRC32 agrees with the reference implementation");
+  assert("crc32('123456789') === 0xCBF43926",
+    crc32(Buffer.from("123456789", "utf8")) === 0xcbf43926,
+    `got 0x${crc32(Buffer.from("123456789", "utf8")).toString(16).toUpperCase()}`);
+  assert("crc32 of empty input === 0", crc32(Buffer.alloc(0)) === 0);
+
+  for (const n of ["a", "b", "c", "d"]) fs.rmSync(tmp(n), { force: true });
+}
+
 // ═══════════ main ═══════════
 
 async function main(): Promise<void> {
   console.log("Invariant harness — Stage 0 (Postgres) + Stage 2 (RAM) + Stage 3 Step 1 (WAL)");
   console.log("============================================================");
   console.log("NOTE: Stage 3 Step 1 restores durability via append+fsync-before-apply.");
-  console.log("      Step 2 adds group commit. No torn-write protection yet (Step 3).");
+  console.log("      Step 2 adds group commit; Step 3 adds length+CRC32 framing.");
   try {
     await testDatabaseEngine();
     await testMemoryEngine();
     await testParity();
     await testWalEngine();
     await testGroupCommit();
+    await testTornWriteProtection();
   } finally {
     await dbReset();
     await pool.end();

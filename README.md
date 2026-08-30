@@ -14,31 +14,32 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 | **Stage 0.5** ✅ | Load harness (k6) | Must produce my own numbers, not assert textbook ones |
 | **Stage 1** ✅ | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
 | **Stage 2** ✅ | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
-| **Stage 3** ◐ | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
+| **Stage 3** ✅ | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
 | **Stage 4** | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
 
-### Current status: **Stage 3 Step 2 — durable WAL with group commit**
+### Current status: **Stage 3 complete — durable WAL (group commit + torn-write protection)**
 
-Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wall at **~181 orders/sec**, dominated by **row-lock contention** (54.2% of backend samples) rather than fsync (0.15%). Stage 2 moved matching into a **single-threaded in-memory engine** — fast, but durability deliberately deleted. Stage 3 rebuilds durability by another route: a **write-ahead log**, written before each order touches memory and fsync'd before any acknowledgement, with crash recovery by deterministic replay. Step 2 adds **group commit**, amortising one fsync across a batch.
+Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wall at **~181 orders/sec**, dominated by **row-lock contention** (54.2% of backend samples) rather than fsync (0.15%). Stage 2 moved matching into a **single-threaded in-memory engine** — fast, but durability deliberately deleted. Stage 3 rebuilt durability by another route: a **write-ahead log** with group commit and CRC32 torn-write protection, reaching **~3254 orders/sec** — **18x the ACID baseline, while still crash-durable**.
 
 | Stage | throughput (ord/s) | p95 | durable? |
 |-------|-------------------|-----|----------|
 | Stage 0: Postgres ACID | ~181 | 36.5ms @5VU / 162.1ms @25VU | yes (ACID) |
 | Stage 2: in-memory | ~2127 | 6.62ms | **no** |
 | Stage 3 Step 1: WAL, fsync-per-order | ~797 | 16.8ms | yes |
-| **Stage 3 Step 2: WAL, group commit** | **~3216** | **11.6ms** | **yes** |
+| Stage 3 Step 2: WAL, group commit | ~3294 | 11.20ms | yes |
+| **Stage 3 Step 3: + torn-write protection** | **~3254** | **11.43ms** | **yes, crash-corruption safe** |
 
-Because cross-session throughput on this host drifts, the load-bearing comparison is a **same-session, interleaved A/B** at 25 VUs (n=3 each):
+Because cross-session throughput on this host drifts, every comparison that carries weight was measured **same-session and interleaved**. At 25 VUs: no durability at all 3380 ord/s, fsync-per-order 1016, group commit 3292 — **group commit recovers 96.3% of what durability cost, for +0.45ms p95**. Adding CRC32 framing then costs a further **1.2%** (0.0% pooled across levels — below the harness's noise floor).
 
-| mode | median ord/s | p95 |
-|------|-------------|-----|
-| no durability at all | 3380 | 10.72ms |
-| fsync per order | 1016 | 30.95ms |
-| **group commit** | **3292** | **11.17ms** |
+Stage 4 is not started.
 
-Durability cost 2365 ord/s; **group commit recovers 96.3% of it for +0.45ms p95**. Against fsync-per-order it is both **3.24x faster** and **2.8x lower latency**. A hard kill mid-load confirmed the property batching risks: 13,320 orders acknowledged, 13,341 recovered from the log — **nothing acknowledged-but-lost**, with 13,341 records replayed in 28.2ms.
+### The WAL, in one place
 
-Step 3 (CRC32 + length-prefixed binary format) is **not** built — the log is still JSON lines and cannot self-verify a torn trailing record. Stage 4 is not started.
+- **append-before-execute** — the record is written before the order touches memory, and fsync'd before anything is acknowledged. Memory can never be ahead of the log.
+- **command logging** — records are submitted orders, not balance deltas; recovery is deterministic re-execution. Sound only because the engine is synchronous and deterministic.
+- **group commit** — one fsync amortised across a batch. Nothing is acknowledged before its own fsync, so there is no acknowledged-but-lost window.
+- **torn-write protection** — `[4-byte length][JSON payload][4-byte CRC32]`. Recovery discards an unacknowledged torn tail and reports genuine mid-file corruption distinctly.
+- **crash recovery** — proved with `taskkill /F` mid-load: 13,447 orders acknowledged, 13,453 recovered, zero negative balances, **13,453 records replayed in 24.7ms**.
 
 **What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no async projection. The Stage 0 Postgres path still exists in `src/orderProcessor.ts` and is still exercised by `npm test`, but the served hot path is now the in-memory engine and is **not durable**.
 
@@ -395,7 +396,7 @@ A matching engine for one instrument is fundamentally **single-writer** — all 
 - [x] **Stage 0.5** — Load harness (k6) + measured baseline (no tuning)
 - [x] **Stage 1** — Profiled the wall: index separated, dominant cost = row-lock contention
 - [x] **Stage 2** — In-memory matching (single-threaded, lock-free) — 11.8x, durability dropped by design
-- [◐] **Stage 3** — Custom WAL: Step 1 (append-before-execute + crash recovery) and Step 2 (group commit, ~3216 ord/s) done. Step 3 (CRC32 torn-write) pending.
+- [x] **Stage 3** — Custom WAL: append-before-execute, group commit, CRC32 torn-write protection, crash recovery (~3254 ord/s)
 - [ ] **Stage 4** — Async projection to Postgres read-model (CQRS)
 
 ## License

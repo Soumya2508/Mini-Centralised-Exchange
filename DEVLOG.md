@@ -711,3 +711,172 @@ The log is a **superset** of what was acknowledged, never a subset. The 21 extra
 **Note:** `npx tsc --noEmit` reports 4 pre-existing strict-mode index-access errors in `engine.ts` (present since Stage 2). `tsx` transpiles without typechecking so runtime is unaffected, and `npm test` passes. Not fixed here — out of scope for this step, but worth clearing before the project is called finished.
 
 **Next:** Step 3 — length-prefixed binary format + CRC32 torn-write protection. Human-driven, not autonomous.
+
+---
+
+## [2026-08-28] — Stage 3 Step 3: torn-write protection (length prefix + CRC32)
+
+**This completes the WAL:** append-before-execute + group commit + torn-write protection + crash recovery.
+
+### 1. The failure, reproduced first
+
+Three valid orders were written to a Step-2 (JSON-lines) log, then a crash mid-write was simulated by appending a half-finished line:
+
+```
+=== valid WAL: 3 records, 294 bytes ===
+{"seq":1,...,"quantity":5}
+{"seq":2,...,"quantity":3}
+{"seq":3,...,"quantity":4}
+
+=== simulate a crash MID-WRITE: append a half-written record ===
+":4}
+{"seq":4,"ts":1788123456789,"userId":3,"symbol":"SOL_US
+
+=== RECOVERY ATTEMPT with current (Step 2, JSON-lines) code ===
+recovery failed: Error: WAL parse failure at line 4/4 (final line) — looks like a TORN WRITE.
+    at Function.replay (src/wal.ts:151:15)
+    at recover (src/recover.ts:51:36)
+```
+
+The process **refused to start**. One interrupted write made three perfectly good, already-acknowledged records unrecoverable. A durable log that cannot survive being interrupted is not durable — this is what licenses the change.
+
+### 2. The fix: framed records
+
+```
+[4-byte length BE] [JSON payload bytes] [4-byte CRC32 BE]
+```
+
+The payload stays JSON so the log is still debuggable; only the frame around it is binary. On disk:
+
+```
+0000000 00 00 00 61 7b 22 73 65 71 22 3a 31 2c 22 74 73  >...a{"seq":1,"ts<
+0000016 22 3a 31 37 38 38 31 32 38 32 36 36 31 38 37 2c  >":1788128266187,<
+```
+
+Two **independent** checks, and both are needed:
+
+- **Length** tells the reader exactly how many bytes to expect, so a short tail is detected without parsing anything.
+- **CRC32** catches a record that is the right length but whose bytes are damaged. Length alone cannot see that.
+
+Append-before-execute and group commit are unchanged — only the bytes written per record changed.
+
+Discarding a torn **trailing** record is correct rather than a compromise: it can only be a record whose fsync never completed, which means it was never acknowledged to any client. Nobody was told it succeeded. A checksum failure that is *not* at the tail is a different thing — real corruption, not an interrupted write — so replay reports it distinctly instead of pretending the log is merely short.
+
+CRC32 uses `zlib.crc32` where available with a table-driven fallback, so the on-disk format does not depend on the Node version.
+
+### 3. Proof
+
+**(a) Torn tail — truncated mid-record.** Same scenario as the reproduction:
+
+```
+  RECOVERY: replayed 3 WAL records in 0.3ms (3 applied, 0 rejected)
+  TORN TAIL: discarded 59 trailing bytes (short-payload) — never acknowledged, safe to drop
+  VERDICT: PASS — identical to pre-torn state; all 3 records recovered
+```
+
+Recovered state was byte-identical to the state captured before the tail was appended. Where Step 2 lost everything, Step 3 loses only the unacknowledged tail.
+
+**(b) CRC catches what length cannot.** A single bit flipped *inside* the last record's payload — file size unchanged, only content damaged:
+
+```
+  flipping byte at offset 303 : 0x74 -> 0x75
+  file size unchanged: 315 bytes — only the CONTENT is damaged
+
+  RECOVERY: replayed 2 WAL records in 0.2ms (2 applied, 0 rejected)
+  TORN TAIL: discarded 105 trailing bytes (crc-mismatch)
+  *** MID-FILE CORRUPTION (crc-mismatch) — not a torn tail.
+      Records after the damage were NOT recovered. ***
+```
+
+The length field was still valid, so a length-only scheme would have accepted the damaged record and replayed corrupt state. The CRC rejected it and the failure was reported as corruption rather than truncation.
+
+**(c) Legacy logs are detected, not silently misread.** Replay auto-detects a Step-1/2 JSON-lines log (first byte `{`) and reads it with the old parser rather than interpreting `{"se` as a 2-billion-byte length field:
+
+```
+  RECOVERY: replayed 1 WAL records in 0.2ms (1 applied, 0 rejected)
+  WAL fmt:  framed (len + JSON + CRC32)
+```
+
+**(d) `npm test` — new section F, all green:**
+
+```
+F. STAGE 3 STEP 3 — torn-write protection (length + CRC32)
+  (a) intact framed log round-trips
+  PASS  all records read back | read=12
+  PASS  nothing discarded | discarded=0
+  PASS  replayed state IDENTICAL to live
+  (b) torn tail — truncated mid-record
+  PASS  torn tail did NOT abort recovery | read=12
+  PASS  torn tail was discarded | discarded=36 reason=short-payload
+  PASS  state after torn tail equals state before it
+  (c) truncated length field (fewer than 4 bytes left)
+  PASS  recovered every complete record | read=8
+  PASS  stump discarded | reason=short-length discarded=2
+  (d) CRC catches damage that the length field cannot
+  PASS  damaged record rejected by CRC | read=9
+  PASS  failure reported as crc-mismatch, not truncation
+  PASS  content damage flagged as corruption, not a torn tail
+  (e) CRC32 agrees with the reference implementation
+  PASS  crc32('123456789') === 0xCBF43926 | got 0xCBF43926
+  PASS  crc32 of empty input === 0
+
+ALL INVARIANTS HOLD
+```
+
+The reference-vector check matters: `0xCBF43926` for `"123456789"` is the standard CRC-32 test vector, so this is a real CRC32 rather than a homemade checksum that is merely self-consistent.
+
+**(e) Hard kill mid-load still recovers cleanly.** 25 VUs, `taskkill /F` at t=4s, framed format:
+
+```
+acknowledged (HTTP 200): 13447   WAL bytes: 1475620
+
+  RECOVERY: replayed 13453 WAL records in 24.7ms (13453 applied, 0 rejected)
+  WAL fmt:  framed (len + JSON + CRC32)
+
+  acknowledged to clients : 13447
+  recovered from the log  : 13453
+  negative balances       : 0
+  VERDICT: PASS - nothing acknowledged-but-lost
+```
+
+The log remains a **superset** of what was acknowledged, never a subset. (k6's match_rate reads 35.33% here because the server was killed mid-run and two thirds of requests hit a dead port — that is the crash, not rejections. This run is a durability test, not a throughput measurement.)
+
+### 4. What CRC cost — measured in the SAME session
+
+Cross-session throughput on this host drifts, so `WAL_FORMAT` was made switchable and both formats were measured **back-to-back, interleaved, 3 runs each**, `match_rate 100.00%` on every run:
+
+| VUs | format | median ord/s | p50 | p95 | cost |
+|-----|--------|-------------|-----|-----|------|
+| 10 | jsonl | 2402.7 | 3.74ms | 5.86ms | |
+| 10 | framed | 2353.5 | 3.89ms | 5.85ms | 2.0% |
+| 25 | jsonl | 3293.9 | 6.85ms | 11.20ms | |
+| 25 | **framed** | **3254.3** | 6.91ms | **11.43ms** | **1.2%** |
+| 50 | jsonl | 3282.5 | 14.48ms | 20.82ms | |
+| 50 | framed | 3290.6 | 14.49ms | 20.66ms | -0.2% |
+
+Pooled across all levels (n=9 each): jsonl 3225.8 vs framed 3224.2 ord/s — **0.0%**.
+
+**The CRC is effectively free.** At 25 VUs it costs 1.2% throughput and +0.23ms p95; at 50 VUs it measured slightly *faster*, which is noise. That is the expected shape: CRC32 over a ~100-byte payload is nanoseconds of arithmetic, while the actual bottleneck is the fsync. Buying crash-corruption safety for ~1% of throughput is not a real trade-off — it is close to free, and the honest way to report it is that the cost is below this harness's run-to-run noise floor.
+
+### RUNNING COMPARISON
+
+| Stage | throughput (ord/s) | p95 | durable? |
+|-------|-------------------|-----|----------|
+| Stage 0: Postgres ACID | ~181 | 36.5ms @5VU / 162.1ms @25VU | yes (ACID) |
+| Stage 2: in-memory, no durability | ~2127 | 6.62ms | **no** |
+| Step 1: WAL, fsync-per-order | ~797 | 16.8ms | yes |
+| Step 2: WAL, group commit | ~3294 | 11.20ms | yes |
+| **Step 3: + torn-write protection** | **~3254** | **11.43ms** | **yes, and crash-corruption safe** |
+
+Step 2 and Step 3 rows are the same-session A/B at 25 VUs and are directly comparable. The first three rows come from earlier sessions and are indicative only.
+
+### The WAL is now complete
+
+- **append-before-execute** — the record is written before the order touches memory
+- **group commit** — one fsync amortised across a batch; nothing acknowledged before its fsync
+- **torn-write protection** — length prefix + CRC32; recovery discards an unacknowledged torn tail and reports genuine corruption distinctly
+- **crash recovery** — deterministic replay; 13,453 records rebuilt in 24.7ms
+
+**Still open:** Bug 5 (single-level match per incoming order) — unchanged deliberate scope cut. Also `npx tsc --noEmit` still reports pre-existing strict-mode index-access errors in `engine.ts` (present since Stage 2); `tsx` transpiles without typechecking so runtime and `npm test` are unaffected, but they are worth clearing before the project is called finished.
+
+**Next:** Stage 4 (async projection to a queryable Postgres read-model). Human-driven, not autonomous. NOT started.

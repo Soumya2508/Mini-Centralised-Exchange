@@ -27,7 +27,7 @@
 
 import { MatchingEngine } from "./engine.js";
 import { bootstrapFromDatabase } from "./bootstrap.js";
-import { Wal, WalRecord, DEFAULT_WAL_PATH } from "./wal.js";
+import { WalRecord, DEFAULT_WAL_PATH, replayDetailed } from "./wal.js";
 
 export interface RecoveryResult {
   engine: MatchingEngine;
@@ -39,6 +39,12 @@ export interface RecoveryResult {
   appliedOnReplay: number;
   rejectedOnReplay: number;
   recoveryMs: number;
+  /** Trailing bytes discarded as a torn (never-acknowledged) record. */
+  discardedBytes: number;
+  tornReason: string | null;
+  /** True if the damage was NOT at the tail — real corruption, not a
+   *  half-finished write. Surfaced so it is never mistaken for routine. */
+  midFileCorruption: boolean;
 }
 
 export async function recover(
@@ -47,8 +53,11 @@ export async function recover(
   // 1. Genesis
   const { engine, balanceRows, restingOrders } = await bootstrapFromDatabase();
 
-  // 2. Replay
-  const records: WalRecord[] = Wal.replay(walPath);
+  // 2. Replay. A torn trailing record is discarded rather than fatal:
+  //    it can only be a write whose fsync never completed, which means
+  //    it was never acknowledged to any client.
+  const r = replayDetailed(walPath);
+  const records: WalRecord[] = r.records;
   const t0 = performance.now();
   let applied = 0;
   let rejected = 0;
@@ -79,5 +88,8 @@ export async function recover(
     appliedOnReplay: applied,
     rejectedOnReplay: rejected,
     recoveryMs,
+    discardedBytes: r.discardedBytes,
+    tornReason: r.stoppedBecause,
+    midFileCorruption: r.midFileCorruption,
   };
 }
