@@ -13,15 +13,21 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 | **Stage 0** ✅ | Fully-transactional Postgres baseline | The honest starting point — can't claim I need complexity until I've built the simple thing and shown where it breaks |
 | **Stage 0.5** ✅ | Load harness (k6) | Must produce my own numbers, not assert textbook ones |
 | **Stage 1** ✅ | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
-| **Stage 2** | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
+| **Stage 2** ✅ | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
 | **Stage 3** | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
 | **Stage 4** | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
 
-### Current status: **Stage 1 complete — wall profiled, not yet optimised**
+### Current status: **Stage 2 complete — in-memory matching, NO DURABILITY**
 
-Stage 0 is a correct transactional baseline with a committed invariant harness. Stage 1 profiled the wall: after adding the missing index, the ACID path plateaus at **~180 orders/sec** (median of 15 steady-state runs), and the dominant cost is **row-lock contention on the head-of-book row** (54% of backend samples), not fsync (0.15%). Stages 2 → 4 are not started, and Stage 2 is not yet licensed — see [DEVLOG.md](DEVLOG.md).
+Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wall at **~180 orders/sec**, dominated by **row-lock contention** (54.2% of backend samples) rather than fsync (0.15%). Stage 2 acted on that: matching now runs in a **single-threaded in-memory engine** at **~2,127 orders/sec (11.8x)**, with lock contention measured at **zero**.
 
-**What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no in-memory matching engine. Durability in Stage 0 is whatever Postgres itself provides via its own ACID guarantees — nothing custom has been built on top. The Stage 0.5 numbers below are a *baseline measurement*, not an optimisation result: nothing has been tuned, and the dominant cost has not yet been profiled.
+> ### ⚠️ This build has NO DURABILITY
+>
+> Stage 2 deliberately traded away Stage 0's ACID guarantees. **A crash loses every balance, resting order and trade since boot** — there is no log, no snapshot, no recovery. This is the intended consequence of removing the transaction from the hot path, not a bug, and it is what **Stage 3 (a write-ahead log with group commit and crash recovery)** exists to restore. Do not treat this as production-shaped.
+
+Stages 3 → 4 are not started.
+
+**What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no async projection. The Stage 0 Postgres path still exists in `src/orderProcessor.ts` and is still exercised by `npm test`, but the served hot path is now the in-memory engine and is **not durable**.
 
 ---
 
@@ -154,6 +160,43 @@ totals: SOL=250.00000000  USDC=50000.00000000   (unchanged)
 ```
 
 ---
+
+## Stage 2 — In-memory engine: ~2,127 orders/sec (11.8x)
+
+`src/engine.ts` holds the order book and all balances in RAM and processes orders one at a time. `processOrder()` is **synchronous** — no `await`, no I/O — so Node's event loop cannot interleave two invocations. That is the whole guarantee: Stage 0 needed `SELECT ... FOR UPDATE` because many database backends touched the same rows at once; here there is exactly one writer, so there is nothing to serialise. Race-freedom is structural, not enforced at runtime.
+
+Postgres is read **once** at boot to load the seeded starting state, then the connection pool is closed — the order path provably cannot reach the database.
+
+Same k6 harness and steady-state protocol as Stage 1. Because state lives in RAM, every run restarts the server so it re-bootstraps a fresh engine from a freshly reset database. 25 runs, interleaved, round 1 discarded, medians of n=4 per level:
+
+| VUs | median ord/s | min | max | spread | p50 | p95 | p99 | vs Stage 1 |
+|-----|-------------|-----|-----|--------|-----|-----|-----|-----------|
+| 1 | 405.9 | 384.2 | 438.4 | 13.4% | 1.40ms | 8.75ms | 17.52ms | 3.0x |
+| 5 | **2194.8** | 2163.1 | 2267.3 | 4.7% | 2.08ms | 3.14ms | 5.01ms | 12.2x |
+| 10 | 2090.1 | 2016.2 | 2168.9 | 7.3% | 4.54ms | 6.62ms | 8.80ms | 11.6x |
+| 25 | 2027.5 | 1974.9 | 2119.5 | 7.1% | 12.10ms | 16.66ms | 19.84ms | 11.0x |
+| 50 | 2048.6 | 2031.3 | 2093.2 | 3.0% | 24.42ms | 31.38ms | 36.25ms | 11.9x |
+
+**Plateau: ~2,127 ord/s** (pooled median, VUs 5-25, n=12) against the **~181 ord/s** Stage 1 baseline — **11.8x**. p95 at the plateau fell from 36.5ms/162.1ms to a median of **6.62ms**. Match rate 100.00% on every run. Run-to-run spread tightened from 10-17% to 3-7%: with the lock manager gone, timing is far more predictable.
+
+### Lock contention: 54.2% → 0%
+
+`pg_stat_activity` sampled 40 times during a 25-VU in-memory run (2,136 ord/s, 42,743 orders):
+
+```
+     40 active|RUNNING          <- the sampling psql session itself, nothing else
+  lock-wait samples: 0
+```
+
+The exchange holds zero database connections while serving orders. Stage 1 had 306 `Lock|tuple` + 52 `Lock|transactionid` out of 660 samples. Contention is gone by construction, not merely reduced.
+
+### What it cost
+
+Everything Stage 0's transaction gave for free. No atomicity across a crash, no recovery, no persistence of any kind. That is the trade this stage exists to make explicit, and Stage 3 is the answer to it.
+
+---
+
+## Stage 1 — The Postgres baseline it replaced: ~180 orders/sec
 
 ## Measured baseline — ~180 orders/sec
 
@@ -338,7 +381,7 @@ A matching engine for one instrument is fundamentally **single-writer** — all 
 - [x] **Stage 0** — Transactional Postgres baseline, hardened, with committed invariant harness
 - [x] **Stage 0.5** — Load harness (k6) + measured baseline (no tuning)
 - [x] **Stage 1** — Profiled the wall: index separated, dominant cost = row-lock contention
-- [ ] **Stage 2** — In-memory matching (single-threaded, lock-free)
+- [x] **Stage 2** — In-memory matching (single-threaded, lock-free) — 11.8x, durability dropped by design
 - [ ] **Stage 3** — Custom WAL (group commit, CRC32 torn-write protection, crash recovery)
 - [ ] **Stage 4** — Async projection to Postgres read-model (CQRS)
 

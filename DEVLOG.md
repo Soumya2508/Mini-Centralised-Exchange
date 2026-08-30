@@ -368,3 +368,76 @@ Evidence 3 — direction of drift. Within this session throughput went *up* (135
 **Mechanism findings from the prior entry are unaffected** — lock contention dominating (54.2% of backend samples) versus fsync (0.15%), and the index removing decay rather than the ceiling, are ratios measured within single sessions and do not depend on the absolute scale.
 
 **Not done:** Stage 2 not started. No code changed in this entry.
+
+---
+
+## [2026-08-28] — Stage 2: in-memory single-writer matching
+
+**Change:** matching moved to RAM — a single-threaded engine (`src/engine.ts`) holding the order book and all balances in memory. No row locks, no per-order DB transaction, nothing written to disk on the hot path. Postgres is read exactly once at boot (`src/bootstrap.ts`) to load the seeded starting state, then the pool is closed, so the order path provably cannot touch the database.
+
+Licensed by Stage 1: row-lock contention was 54.2% of backend samples against 0.15% for fsync, so the indicated move was to remove the lock manager from the hot path.
+
+**Race-free by construction, not by locking.** `processOrder()` is **synchronous** — no `await`, no I/O, no callback. Node's event loop cannot interleave two invocations: one runs to completion before any other JavaScript runs. Stage 0 needed `SELECT ... FOR UPDATE` because many Postgres backends touched the same rows concurrently; here there is exactly one writer, so there is nothing to serialise. Making this function `async` would silently destroy the guarantee, and the file says so at the call site.
+
+**Matching semantics: unchanged from Stage 0.** Price-time priority, at-or-below limit for buys, trade at the resting order's price, ONE price level per incoming order (the `LIMIT 1` scope cut, Bug 5, still open), partial takers keep their original quantity and rest on the book, conservative taker fund check, maker solvency check. The in-memory negative-balance guard replaces `CHECK (available >= 0)`, which does not exist in RAM.
+
+### ⚠️ DURABILITY: DELIBERATELY DROPPED
+
+A crash — process kill, power loss, unhandled throw — now loses **all** state: every balance, every resting order, every trade executed since boot. There is no log, no snapshot, no recovery. Money that "moved" is gone. Restarting reloads only the seeded starting state.
+
+This is the intended consequence of the Stage 1 → Stage 2 trade, not an oversight, and must not be patched in place. Stage 3 rebuilds durability by another route (write-ahead log, group commit, crash recovery). Adding any persistence here would pre-empt Stage 3 and make its measurement meaningless. The warning is repeated in `engine.ts`, `bootstrap.ts`, `server.ts`, the harness banner and the README.
+
+**Correctness:** `npm test` now runs the same invariants against **both** engines and then compares them directly, so "a port, not a redesign" is proved rather than asserted — 33 assertions, all passing:
+
+```
+A. STAGE 0 — transactional Postgres engine
+  (a) conservation      PASS x3   alice={"ok":true,"qty":5,"price":90} eve={"ok":true,"qty":3,"price":95}
+  (b) no negatives      PASS x3   Maker (user 2) has insufficient SOL: have 1, need 5
+  (c) genuine race      PASS x6   exactly one buyer filled; bob sold exactly 5, not 10; trades=1
+
+B. STAGE 2 — in-memory single-writer engine
+  (a) conservation      PASS x3   total unchanged USDC 50000, SOL 250
+  (b) no negatives      PASS x3   Maker (user 2) has insufficient SOL: have 1, need 5
+  (c) genuine race      PASS x6   exactly one buyer filled; bob SOL=45; trades=1
+
+C. PARITY — identical scenarios, identical observable outcomes
+  PASS  price improvement                    FILL 5@90
+  PASS  price-time priority                  FILL 5@90 | FILL 3@95
+  PASS  no match above limit                 FILL 5@90 | FILL 3@95 | REJECT No matching resting order found
+  PASS  partial fill rests remainder         FILL 5@90
+  PASS  rested remainder filled later        FILL 5@90 | FILL 5@90
+  (each paired with a same-balances assertion: alice/bob SOL,USDC identical)
+
+ALL INVARIANTS HOLD (both engines agree)
+```
+
+Parity holds down to the exact error strings and final balances, across all five scenarios.
+
+**Throughput:** same k6 harness and steady-state protocol as Stage 1. Because state now lives in RAM, resetting the database no longer resets the engine — so **every run restarts the server**, which re-bootstraps a fresh engine from a freshly reset and reseeded database. 25 runs, 15s each, interleaved, round 1 discarded.
+
+| VUs | n | median ord/s | min | max | spread | p50 | p95 | p99 | vs Stage 1 |
+|-----|---|-------------|-----|-----|--------|-----|-----|-----|-----------|
+| 1 | 4 | 405.9 | 384.2 | 438.4 | 13.4% | 1.40ms | 8.75ms | 17.52ms | 3.0x |
+| 5 | 4 | **2194.8** | 2163.1 | 2267.3 | 4.7% | 2.08ms | 3.14ms | 5.01ms | 12.2x |
+| 10 | 4 | 2090.1 | 2016.2 | 2168.9 | 7.3% | 4.54ms | 6.62ms | 8.80ms | 11.6x |
+| 25 | 4 | 2027.5 | 1974.9 | 2119.5 | 7.1% | 12.10ms | 16.66ms | 19.84ms | 11.0x |
+| 50 | 4 | 2048.6 | 2031.3 | 2093.2 | 3.0% | 24.42ms | 31.38ms | 36.25ms | 11.9x |
+
+Plateau pooled (VUs 5/10/25, n=12): **median 2126.8 ord/s**, min 1974.9, max 2267.3.
+
+**In-memory ~2,127 ord/s vs the ~180.9 ord/s authoritative baseline = 11.8x speedup.** p95 at the plateau fell from 36.5ms (5 VUs) / 162.1ms (25 VUs) to a median of **6.62ms**. Match rate was 100.00% on every run. Run-to-run spread also tightened from Stage 1's 10-17% to 3-7% — with the lock manager gone, the timing is far more predictable.
+
+Note: unlike Stage 1, round 1 was **not** anomalous here (it was marginally the fastest). Because every run restarts the server, each run is equally cold, so the warm-up effect that made Stage 1's first round 22-41% low does not apply. Round 1 was still discarded for protocol consistency.
+
+**Lock contention: eliminated.** `pg_stat_activity` sampled 40 times during a 25-VU in-memory run (2136 ord/s, 42,743 orders, 100% match):
+
+```
+     40 active|RUNNING          <- the sampling psql session itself, nothing else
+  lock-wait samples: 0
+```
+
+The exchange holds **zero** database connections while serving orders — the pool is closed after bootstrap. Against Stage 1's 306 `Lock|tuple` + 52 `Lock|transactionid` out of 660 samples, row-lock contention went from **54.2% to 0%**. It is gone by construction, not merely reduced.
+
+**Still open:** Bug 5 (single-level match) — unchanged, deliberate scope cut, carried into the in-memory engine as-is.
+
+**Next:** Stage 3 (WAL) — restore durability without reintroducing the Stage 1 wall. Human-driven, not autonomous.
