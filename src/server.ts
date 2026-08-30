@@ -1,27 +1,30 @@
+// ── Stage 2 API — serves the IN-MEMORY engine ─────────────────
+//
+// ⚠️  NO DURABILITY. State lives only in this process's heap. Killing
+// the server discards every balance, resting order and trade produced
+// since boot. Restarting reloads the seeded starting state from
+// Postgres and everything that happened in between is gone.
+// Stage 3 (WAL) restores durability. See engine.ts.
+
 import express from "express";
-import { processOrder } from "./orderProcessor.js";
+import { MatchingEngine } from "./engine.js";
+import { bootstrapFromDatabase } from "./bootstrap.js";
 import { pool } from "./db.js";
 
 const app = express();
 app.use(express.json());
 
+let engine: MatchingEngine;
+
 // ── Health check ─────────────────────────────────────────────
-app.get("/health", async (_req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ status: "ok", db: "connected" });
-  } catch {
-    res.status(500).json({ status: "error", db: "disconnected" });
-  }
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", engine: engine ? "in-memory" : "not ready", durable: false });
 });
 
-// ── Place an order ───────────────────────────────────────────
-// POST /order
-// Body: { userId, symbol, side, price, quantity }
-app.post("/order", async (req, res) => {
+// ── Place an order (hot path: RAM only, no DB, no locks) ──────
+app.post("/order", (req, res) => {
   const { userId, symbol, side, price, quantity } = req.body;
 
-  // Basic input validation
   if (!userId || !symbol || !side || !price || !quantity) {
     res.status(400).json({ success: false, error: "Missing required fields: userId, symbol, side, price, quantity" });
     return;
@@ -36,65 +39,44 @@ app.post("/order", async (req, res) => {
   }
 
   try {
-    const trade = await processOrder({ userId, symbol, side, price, quantity });
+    // Synchronous: runs to completion with no interleaving.
+    const trade = engine.processOrder({ userId, symbol, side, price, quantity });
     res.json({ success: true, trade });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    console.error(`Order failed: ${message}`);
     res.status(400).json({ success: false, error: message });
   }
 });
 
-// ── View balances (debug / verification) ─────────────────────
-app.get("/balances", async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT u.username, b.asset, b.available, b.locked
-       FROM users u JOIN balances b ON u.id = b.user_id
-       ORDER BY u.id, b.asset`
-    );
-    res.json(result.rows);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    res.status(500).json({ error: message });
-  }
+// ── Read endpoints (served from RAM) ─────────────────────────
+app.get("/balances", (_req, res) => {
+  const out: Array<{ asset: string; total: number }> = [];
+  for (const [asset, total] of engine.totals()) out.push({ asset, total });
+  res.json({ totals: out, negativeBalances: engine.negativeBalanceCount() });
 });
 
-// ── View orders (debug / verification) ───────────────────────
-app.get("/orders", async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, user_id, symbol, side, price, quantity, filled, status, created_at
-       FROM orders ORDER BY id`
-    );
-    res.json(result.rows);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    res.status(500).json({ error: message });
-  }
-});
+app.get("/orders", (_req, res) => res.json(engine.getOrders()));
+app.get("/trades", (_req, res) => res.json(engine.getTrades()));
 
-// ── View trades (debug / verification) ───────────────────────
-app.get("/trades", async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, symbol, price, quantity, buyer_order_id, seller_order_id, created_at
-       FROM trades ORDER BY id`
-    );
-    res.json(result.rows);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    res.status(500).json({ error: message });
-  }
-});
-
-// ── Start server ─────────────────────────────────────────────
+// ── Start: bootstrap RAM from Postgres once, then serve ───────
 const PORT = process.env.PORT ?? 3000;
-app.listen(PORT, () => {
-  console.log(`Exchange API listening on http://localhost:${PORT}`);
-  console.log(`  POST /order         — place an order`);
-  console.log(`  GET  /balances      — view all balances`);
-  console.log(`  GET  /orders        — view all orders`);
-  console.log(`  GET  /trades        — view all trades`);
-  console.log(`  GET  /health        — health check`);
-});
+
+bootstrapFromDatabase()
+  .then(({ engine: e, balanceRows, restingOrders }) => {
+    engine = e;
+    // The bootstrap read is the only DB access; release the pool so it
+    // is unmistakable that the hot path never touches Postgres.
+    return pool.end().then(() => ({ balanceRows, restingOrders }));
+  })
+  .then(({ balanceRows, restingOrders }) => {
+    app.listen(PORT, () => {
+      console.log(`Exchange API (Stage 2, IN-MEMORY) on http://localhost:${PORT}`);
+      console.log(`  bootstrapped ${balanceRows} balances, ${restingOrders} resting orders from Postgres`);
+      console.log(`  DB pool closed — order path is RAM only`);
+      console.log(`  *** NO DURABILITY: a crash loses all state (Stage 3 restores it) ***`);
+    });
+  })
+  .catch((err) => {
+    console.error("bootstrap failed:", err);
+    process.exit(1);
+  });

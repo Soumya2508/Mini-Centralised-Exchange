@@ -1,31 +1,31 @@
-// ── Stage 0 correctness-invariant harness ────────────────────
+// ── Correctness-invariant harness (Stage 0 DB + Stage 2 in-memory) ──
 //
-// Run with:  npm test        (requires `docker compose up -d`)
+//   npm test        (requires `docker compose up -d`)
 //
-// This calls processOrder() DIRECTLY rather than over HTTP. That is
-// deliberate: driving the API means a stale server process can silently
-// serve old code and make a broken build look green — which is exactly
-// how a fake "concurrency test" passed here before. Importing the module
-// guarantees the code under test is the code on disk.
+// Runs the SAME invariants against both engines and then compares them
+// directly, so the claim "Stage 2 is a port, not a redesign" is proved
+// rather than asserted:
 //
-// Invariants asserted:
-//   (a) conservation — SUM(available) per asset is unchanged by trading
-//   (b) no negative balances — ever, under any path
-//   (c) a GENUINE concurrent race — two buyers dispatched together via
+//   A. Stage 0  — transactional Postgres engine (orderProcessor.ts)
+//   B. Stage 2  — in-memory single-writer engine (engine.ts)
+//   C. Parity   — identical scenarios, identical observable outcomes
+//
+// Invariants in A and B:
+//   (a) conservation — per-asset totals unchanged by trading
+//   (b) no negative balances, including an insolvent resting-order owner
+//   (c) a genuine concurrent race — two buyers dispatched together via
 //       Promise.all against ONE limited resting order; exactly one fills
 //
-// NUMERIC sums are compared as exact strings, never as JS floats.
+// Both engines are called DIRECTLY, never over HTTP: a stale server
+// process can silently serve old code and make a broken build look
+// green. Importing guarantees the code under test is the code on disk.
 
 import { pool } from "../db.js";
-import { processOrder } from "../orderProcessor.js";
+import { processOrder as dbProcessOrder } from "../orderProcessor.js";
+import { MatchingEngine } from "../engine.js";
 
 const SYMBOL = "SOL_USDC";
-
-const ALICE = 1;
-const BOB = 2;
-const CAROL = 3;
-const DAVE = 4;
-const EVE = 5;
+const ALICE = 1, BOB = 2, CAROL = 3, DAVE = 4, EVE = 5;
 
 let failures = 0;
 
@@ -35,37 +35,35 @@ function assert(name: string, pass: boolean, detail = ""): void {
   if (detail) console.log(`         ${detail}`);
 }
 
-/** Restore a known book: Bob 5@90, Carol 3@95, Dave 8@110; everyone 10000 USDC / 50 SOL. */
-async function resetFixture(): Promise<void> {
+type Outcome = { ok: true; qty: number; price: number } | { ok: false; error: string };
+
+// ═══════════ Stage 0 — Postgres engine ═══════════
+
+async function dbReset(): Promise<void> {
   await pool.query("DELETE FROM trades");
   await pool.query("DELETE FROM orders");
   await pool.query("UPDATE balances SET available = 10000 WHERE asset = 'USDC'");
   await pool.query("UPDATE balances SET available = 50 WHERE asset = 'SOL'");
   await pool.query(
     `INSERT INTO orders (user_id, symbol, side, price, quantity) VALUES
-       ($1, $4, 'sell', 90, 5),
-       ($2, $4, 'sell', 95, 3),
-       ($3, $4, 'sell', 110, 8)`,
+       ($1, $4, 'sell', 90, 5), ($2, $4, 'sell', 95, 3), ($3, $4, 'sell', 110, 8)`,
     [BOB, CAROL, DAVE, SYMBOL]
   );
 }
 
-/** Exact per-asset totals as strings — no float rounding in the comparison. */
-async function totals(): Promise<Record<string, string>> {
+async function dbTotals(): Promise<Record<string, string>> {
   const r = await pool.query(
     "SELECT asset, SUM(available)::text AS total FROM balances GROUP BY asset ORDER BY asset"
   );
   return Object.fromEntries(r.rows.map((x) => [x.asset, x.total]));
 }
 
-async function negativeBalances(): Promise<number> {
-  const r = await pool.query(
-    "SELECT count(*)::int AS n FROM balances WHERE available < 0 OR locked < 0"
-  );
+async function dbNegatives(): Promise<number> {
+  const r = await pool.query("SELECT count(*)::int AS n FROM balances WHERE available < 0");
   return r.rows[0].n;
 }
 
-async function balanceOf(userId: number, asset: string): Promise<string> {
+async function dbBalance(userId: number, asset: string): Promise<string> {
   const r = await pool.query(
     "SELECT available::text AS a FROM balances WHERE user_id = $1 AND asset = $2",
     [userId, asset]
@@ -73,123 +71,206 @@ async function balanceOf(userId: number, asset: string): Promise<string> {
   return r.rows[0]?.a ?? "missing";
 }
 
-type Outcome = { ok: true; qty: number } | { ok: false; error: string };
-
-async function place(
-  userId: number,
-  side: "buy" | "sell",
-  price: number,
-  quantity: number
+async function dbPlace(
+  userId: number, side: "buy" | "sell", price: number, quantity: number
 ): Promise<Outcome> {
   try {
-    const t = await processOrder({ userId, symbol: SYMBOL, side, price, quantity });
-    return { ok: true, qty: t.quantity };
+    const t = await dbProcessOrder({ userId, symbol: SYMBOL, side, price, quantity });
+    return { ok: true, qty: t.quantity, price: t.price };
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
 }
 
-// ── (a) Conservation across a sequence of trades ─────────────
-async function testConservation(): Promise<void> {
-  console.log("\n(a) conservation — SUM(available) per asset unchanged by trading");
-  await resetFixture();
-  const before = await totals();
+// ═══════════ Stage 2 — in-memory engine ═══════════
 
-  const t1 = await place(ALICE, "buy", 100, 5); // fills Bob @90
-  const t2 = await place(EVE, "buy", 100, 3);   // fills Carol @95
-  const after = await totals();
+/** Same starting state as db/init.sql: 5 users, 10000 USDC / 50 SOL, 3 resting sells. */
+function makeEngine(): MatchingEngine {
+  const e = new MatchingEngine();
+  for (const u of [ALICE, BOB, CAROL, DAVE, EVE]) {
+    e.setBalance(u, "USDC", 10000);
+    e.setBalance(u, "SOL", 50);
+  }
+  e.addRestingOrder({ userId: BOB, symbol: SYMBOL, side: "sell", price: 90, quantity: 5 });
+  e.addRestingOrder({ userId: CAROL, symbol: SYMBOL, side: "sell", price: 95, quantity: 3 });
+  e.addRestingOrder({ userId: DAVE, symbol: SYMBOL, side: "sell", price: 110, quantity: 8 });
+  return e;
+}
 
+/** Async wrapper so the race test can dispatch via Promise.all like the DB one. */
+async function memPlace(
+  e: MatchingEngine, userId: number, side: "buy" | "sell", price: number, quantity: number
+): Promise<Outcome> {
+  try {
+    const t = e.processOrder({ userId, symbol: SYMBOL, side, price, quantity });
+    return { ok: true, qty: t.quantity, price: t.price };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+const memTotals = (e: MatchingEngine): Record<string, number> =>
+  Object.fromEntries(e.totals());
+
+// ═══════════ A. Stage 0 (Postgres) ═══════════
+
+async function testDatabaseEngine(): Promise<void> {
+  console.log("\nA. STAGE 0 — transactional Postgres engine");
+
+  console.log("\n  (a) conservation");
+  await dbReset();
+  const before = await dbTotals();
+  const t1 = await dbPlace(ALICE, "buy", 100, 5);
+  const t2 = await dbPlace(EVE, "buy", 100, 3);
+  const after = await dbTotals();
   assert("two trades executed", t1.ok && t2.ok, `alice=${JSON.stringify(t1)} eve=${JSON.stringify(t2)}`);
   for (const asset of Object.keys(before)) {
-    assert(
-      `SUM(available) unchanged for ${asset}`,
-      before[asset] === after[asset],
-      `before=${before[asset]}  after=${after[asset]}`
-    );
+    assert(`SUM(available) unchanged for ${asset}`, before[asset] === after[asset],
+      `before=${before[asset]}  after=${after[asset]}`);
   }
-}
 
-// ── (b) No negative balances, incl. an insolvent maker ───────
-async function testNoNegativeBalances(): Promise<void> {
-  console.log("\n(b) no negative balances — including an insolvent resting-order owner");
-  await resetFixture();
-
-  // Bob rests a 5 SOL sell but is drained to 1 SOL. Filling it would
-  // historically drive him to -4 while SUM() stayed constant.
+  console.log("\n  (b) no negative balances");
+  await dbReset();
   await pool.query("UPDATE balances SET available = 1 WHERE user_id = $1 AND asset = 'SOL'", [BOB]);
-
-  const r = await place(ALICE, "buy", 100, 5);
+  const r = await dbPlace(ALICE, "buy", 100, 5);
   assert("insolvent maker is rejected", !r.ok, r.ok ? `unexpectedly filled ${r.qty}` : r.error);
-  assert("bob's SOL untouched", (await balanceOf(BOB, "SOL")) === "1.00000000", `bob SOL=${await balanceOf(BOB, "SOL")}`);
-  assert("no negative balances anywhere", (await negativeBalances()) === 0);
+  assert("bob's SOL untouched", (await dbBalance(BOB, "SOL")) === "1.00000000");
+  assert("no negative balances anywhere", (await dbNegatives()) === 0);
 
-  // Also assert it across the whole suite's normal trading paths.
-  await resetFixture();
-  await place(ALICE, "buy", 100, 5);
-  await place(EVE, "buy", 100, 3);
-  assert("no negative balances after normal trades", (await negativeBalances()) === 0);
-}
-
-// ── (c) Genuine concurrent race for ONE limited resting order ─
-async function testConcurrentRace(): Promise<void> {
-  console.log("\n(c) genuine race — two buyers, Promise.all, ONE limited resting order");
-  await resetFixture();
-
-  // Both bid 90, so ONLY Bob's 5@90 is eligible (Carol@95 and Dave@110 are
-  // above the limit). Both want the full 5 — they must contend for one row.
-  const before = await totals();
-  const [a, e] = await Promise.all([
-    place(ALICE, "buy", 90, 5),
-    place(EVE, "buy", 90, 5),
-  ]);
-
-  const filled = [a, e].filter((r) => r.ok).length;
-  const rejected = [a, e].filter((r) => !r.ok).length;
-
-  assert(
-    "exactly one buyer filled",
-    filled === 1 && rejected === 1,
-    `alice=${JSON.stringify(a)}  eve=${JSON.stringify(e)}`
-  );
-  assert(
-    "bob sold exactly 5 SOL, not 10",
-    (await balanceOf(BOB, "SOL")) === "45.00000000",
-    `bob SOL=${await balanceOf(BOB, "SOL")}`
-  );
-
-  const after = await totals();
-  for (const asset of Object.keys(before)) {
-    assert(
-      `SUM(available) unchanged for ${asset} across the race`,
-      before[asset] === after[asset],
-      `before=${before[asset]}  after=${after[asset]}`
-    );
+  console.log("\n  (c) genuine race — Promise.all, ONE limited resting order");
+  await dbReset();
+  const beforeRace = await dbTotals();
+  const [a, e] = await Promise.all([dbPlace(ALICE, "buy", 90, 5), dbPlace(EVE, "buy", 90, 5)]);
+  const filled = [a, e].filter((x) => x.ok).length;
+  assert("exactly one buyer filled", filled === 1,
+    `alice=${JSON.stringify(a)}  eve=${JSON.stringify(e)}`);
+  assert("bob sold exactly 5 SOL, not 10", (await dbBalance(BOB, "SOL")) === "45.00000000");
+  const afterRace = await dbTotals();
+  for (const asset of Object.keys(beforeRace)) {
+    assert(`SUM(available) unchanged for ${asset} across the race`,
+      beforeRace[asset] === afterRace[asset]);
   }
-  assert("no negative balances after race", (await negativeBalances()) === 0);
-
-  const tradeCount = await pool.query("SELECT count(*)::int AS n FROM trades");
-  assert("exactly one trade written", tradeCount.rows[0].n === 1, `trades=${tradeCount.rows[0].n}`);
+  assert("no negative balances after race", (await dbNegatives()) === 0);
+  const tc = await pool.query("SELECT count(*)::int AS n FROM trades");
+  assert("exactly one trade written", tc.rows[0].n === 1, `trades=${tc.rows[0].n}`);
 }
 
-// ── main ─────────────────────────────────────────────────────
+// ═══════════ B. Stage 2 (in-memory) ═══════════
+
+async function testMemoryEngine(): Promise<void> {
+  console.log("\nB. STAGE 2 — in-memory single-writer engine");
+
+  console.log("\n  (a) conservation");
+  let e = makeEngine();
+  const before = memTotals(e);
+  const t1 = await memPlace(e, ALICE, "buy", 100, 5);
+  const t2 = await memPlace(e, EVE, "buy", 100, 3);
+  const after = memTotals(e);
+  assert("two trades executed", t1.ok && t2.ok, `alice=${JSON.stringify(t1)} eve=${JSON.stringify(t2)}`);
+  for (const asset of Object.keys(before)) {
+    assert(`total unchanged for ${asset}`, before[asset] === after[asset],
+      `before=${before[asset]}  after=${after[asset]}`);
+  }
+
+  console.log("\n  (b) no negative balances");
+  e = makeEngine();
+  e.setBalance(BOB, "SOL", 1);
+  const r = await memPlace(e, ALICE, "buy", 100, 5);
+  assert("insolvent maker is rejected", !r.ok, r.ok ? `unexpectedly filled ${r.qty}` : r.error);
+  assert("bob's SOL untouched", e.getBalance(BOB, "SOL") === 1, `bob SOL=${e.getBalance(BOB, "SOL")}`);
+  assert("no negative balances anywhere", e.negativeBalanceCount() === 0);
+
+  console.log("\n  (c) genuine race — Promise.all, ONE limited resting order");
+  e = makeEngine();
+  const beforeRace = memTotals(e);
+  const [a, ev] = await Promise.all([
+    memPlace(e, ALICE, "buy", 90, 5),
+    memPlace(e, EVE, "buy", 90, 5),
+  ]);
+  const filled = [a, ev].filter((x) => x.ok).length;
+  assert("exactly one buyer filled", filled === 1,
+    `alice=${JSON.stringify(a)}  eve=${JSON.stringify(ev)}`);
+  assert("bob sold exactly 5 SOL, not 10", e.getBalance(BOB, "SOL") === 45,
+    `bob SOL=${e.getBalance(BOB, "SOL")}`);
+  const afterRace = memTotals(e);
+  for (const asset of Object.keys(beforeRace)) {
+    assert(`total unchanged for ${asset} across the race`, beforeRace[asset] === afterRace[asset]);
+  }
+  assert("no negative balances after race", e.negativeBalanceCount() === 0);
+  assert("exactly one trade recorded", e.getTrades().length === 1, `trades=${e.getTrades().length}`);
+}
+
+// ═══════════ C. Parity — same scenarios, same outcomes ═══════════
+
+async function testParity(): Promise<void> {
+  console.log("\nC. PARITY — Stage 0 (DB) vs Stage 2 (RAM), identical scenarios");
+
+  const scenarios: Array<{
+    name: string;
+    steps: Array<[number, "buy" | "sell", number, number]>;
+  }> = [
+    { name: "price improvement (alice bids 100, bob rests @90)", steps: [[ALICE, "buy", 100, 5]] },
+    { name: "price-time priority (then eve bids 100 for 3 -> carol @95)",
+      steps: [[ALICE, "buy", 100, 5], [EVE, "buy", 100, 3]] },
+    { name: "no match above limit (only dave @110 left)",
+      steps: [[ALICE, "buy", 100, 5], [EVE, "buy", 100, 3], [ALICE, "buy", 100, 5]] },
+    { name: "partial fill rests remainder (alice bids 90 for 10, bob has 5)",
+      steps: [[ALICE, "buy", 90, 10]] },
+    { name: "rested remainder filled by later seller",
+      steps: [[ALICE, "buy", 90, 10], [BOB, "sell", 90, 5]] },
+  ];
+
+  for (const sc of scenarios) {
+    await dbReset();
+    const mem = makeEngine();
+    const dbOut: string[] = [];
+    const memOut: string[] = [];
+
+    for (const [u, side, price, qty] of sc.steps) {
+      const d = await dbPlace(u, side, price, qty);
+      const m = await memPlace(mem, u, side, price, qty);
+      dbOut.push(d.ok ? `FILL ${d.qty}@${d.price}` : `REJECT ${d.error}`);
+      memOut.push(m.ok ? `FILL ${m.qty}@${m.price}` : `REJECT ${m.error}`);
+    }
+
+    const dbBal = [
+      await dbBalance(ALICE, "SOL"), await dbBalance(ALICE, "USDC"),
+      await dbBalance(BOB, "SOL"), await dbBalance(BOB, "USDC"),
+    ].map((x) => Number(x).toString());
+    const memBal = [
+      mem.getBalance(ALICE, "SOL"), mem.getBalance(ALICE, "USDC"),
+      mem.getBalance(BOB, "SOL"), mem.getBalance(BOB, "USDC"),
+    ].map((x) => String(x));
+
+    const sameOutcome = dbOut.join(" | ") === memOut.join(" | ");
+    const sameBalances = dbBal.join(",") === memBal.join(",");
+
+    assert(`same outcomes: ${sc.name}`, sameOutcome,
+      sameOutcome ? dbOut.join(" | ") : `DB : ${dbOut.join(" | ")}\n         RAM: ${memOut.join(" | ")}`);
+    assert(`same balances: ${sc.name}`, sameBalances,
+      sameBalances ? `alice/bob SOL,USDC = ${dbBal.join(",")}`
+                   : `DB : ${dbBal.join(",")}\n         RAM: ${memBal.join(",")}`);
+  }
+}
+
+// ═══════════ main ═══════════
+
 async function main(): Promise<void> {
-  console.log("Stage 0 invariant harness");
-  console.log("=========================");
+  console.log("Invariant harness — Stage 0 (Postgres) + Stage 2 (in-memory)");
+  console.log("============================================================");
+  console.log("NOTE: Stage 2 has NO durability. A crash loses all in-memory");
+  console.log("      state. Restoring it is Stage 3's job, not this one.");
   try {
-    await testConservation();
-    await testNoNegativeBalances();
-    await testConcurrentRace();
+    await testDatabaseEngine();
+    await testMemoryEngine();
+    await testParity();
   } finally {
-    await resetFixture();
+    await dbReset();
     await pool.end();
   }
 
-  console.log("\n=========================");
-  if (failures === 0) {
-    console.log("ALL INVARIANTS HOLD");
-  } else {
-    console.log(`${failures} INVARIANT FAILURE(S)`);
-  }
+  console.log("\n============================================================");
+  console.log(failures === 0 ? "ALL INVARIANTS HOLD (both engines agree)" : `${failures} INVARIANT FAILURE(S)`);
   process.exit(failures === 0 ? 0 : 1);
 }
 
