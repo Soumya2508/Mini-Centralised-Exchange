@@ -573,3 +573,141 @@ The first WAL sweep returned `match_rate = 0.00%` on every run. Cause: the `dock
 **Not done (deliberate):** no group commit (Step 2), no CRC32 or length-prefixed binary format (Step 3). JSON lines cannot self-verify, so a torn trailing record currently fails replay loudly rather than being discarded — `Wal.replay` names this explicitly. That failure is what licenses Step 3.
 
 **Next:** Step 2 — group commit, licensed by the 62.5% cost measured here. Human-driven, not autonomous.
+
+---
+
+## [2026-08-28] — Stage 3 Step 2: group commit (batched fsync)
+
+**Change:** `GroupCommitWal` in `src/wal.ts` amortises one fsync across many orders. Step 1 measured a hard ceiling of ~800-1000 fsync/s, flat across concurrency — the disk's serialised synchronous-write rate. One fsync per order cannot beat it; sharing an fsync can.
+
+**Order path — the whole correctness story is the ordering:**
+
+```
+1. write()  the record to the log     <- ordered, NOT yet durable
+2. apply    the order to the engine
+3. fsync    once per batch            <- THE durability point
+4. ACK      the client
+```
+
+Step 1 precedes step 2, so this is never apply-then-log. Step 3 precedes step 4, so nothing is ever acknowledged before it is on disk. This is the model Postgres uses: a backend does its work and writes WAL records, then blocks at COMMIT until the WAL is flushed — several backends waiting on the same flush *is* group commit.
+
+**Why "applied but not yet fsynced" is safe:** that state exists only in RAM. If the process dies there, memory dies with it and recovery replays a log that simply lacks the order — as if it never arrived. The client was never told otherwise, because the ack had not been sent. There is no acknowledged-but-lost window.
+
+**Why there can be no hole in the log:** writes append in call order and a batch fsync durably commits a *prefix* of the file. If order Y is durable then every order written before it is durable too, so replay can never see Y without X.
+
+Format unchanged — still JSON lines, still no self-verification. Torn-write protection is Step 3.
+
+### Tuning
+
+Measured at VUs=25, two runs per configuration:
+
+| maxBatch | maxDelay | throughput | p50 | p95 | avgBatch |
+|---------|---------|-----------|-----|-----|----------|
+| 16 | 1ms | 3607 / 3500 | 6.6-6.8ms | ~10.0ms | 13.1 |
+| 32 | 1ms | 3554 / 3476 | 6.3-6.5ms | ~10.6ms | 18.5 |
+| 64 | 2ms | 3504 / 3379 | 6.2-6.4ms | ~11.0ms | 20.5 |
+| 128 | 5ms | 1609 / 1603 | ~15.1ms | ~21.6ms | 24.8 |
+| 256 | 5ms | 1611 / 1595 | ~15.1ms | ~22.1ms | 24.7 |
+| 64 | 0 (setImmediate) | 3539 / 3430 | ~6.5ms | ~10.6ms | 18.5 |
+
+A 5ms delay **halves** throughput: batches rarely fill, so nearly every flush pays the full timer. Batch size is bounded by in-flight requests, so a large `maxBatch` without matching concurrency just defers to the delay trigger.
+
+### The Windows timer finding (this changed the default)
+
+At **1 VU** the timer-based trigger collapsed to **69 ord/s, p50 15.3ms**. That 15.3ms is not a coincidence: Windows' default timer resolution is ~15.6ms, so `setTimeout(1)` does **not** fire in 1ms. With one order in flight the batch never fills, so every single order waited a full timer tick.
+
+Switching the trigger to `setImmediate` (flush at the end of the current event-loop turn) instead of a timer:
+
+| VUs | maxDelay=0 (setImmediate) | maxDelay=1ms (setTimeout) | gain |
+|-----|--------------------------|--------------------------|------|
+| 1 | **603.2** (p95 2.13ms) | 68.8 (p95 16.35ms) | **8.8x** |
+| 5 | **1759.6** (p95 3.82ms) | 686.6 (p95 16.18ms) | **2.6x** |
+| 10 | 2407.6 (p95 5.82ms) | 2206.3 (p95 8.37ms) | 1.09x |
+| 25 | 3282.6 (p95 11.26ms) | 3214.2 (p95 11.44ms) | ~equal |
+| 50 | 3322.1 (p95 20.06ms) | 3427.8 (p95 19.69ms) | ~equal |
+
+**Chosen default: maxBatch=32, maxDelay=0 (setImmediate).** Equal at high concurrency, dramatically better at low. A timer-based group commit on Windows silently punishes the low-traffic case by an order of magnitude.
+
+### Throughput (final sweep, batch=32 + setImmediate, 4 rounds, r1 discarded, n=3/level)
+
+| VUs | n | median ord/s | min | max | p50 | p95 | p99 | avgBatch |
+|-----|---|-------------|-----|-----|-----|-----|-----|----------|
+| 1 | 3 | 543.9 | 537.7 | 547.7 | 1.62ms | 2.35ms | 3.15ms | 1.00 |
+| 5 | 3 | 1675.3 | 1627.1 | 1683.4 | 2.65ms | 4.09ms | 5.50ms | 2.50 |
+| 10 | 3 | 2332.3 | 2284.5 | 2377.7 | 3.87ms | 6.10ms | 7.71ms | 5.00 |
+| 25 | 3 | **3216.2** | 3210.1 | 3227.6 | 7.06ms | 11.56ms | 14.82ms | 18.22 |
+| 50 | 3 | 3232.6 | 3143.8 | 3281.1 | 14.65ms | 20.96ms | 27.60ms | 20.72 |
+
+Match rate 100.00% on every run. Note the shape change: earlier stages plateaued from 5 VUs, group commit **keeps scaling to 25 VUs** — because batch size grows with in-flight requests, so more concurrency means a better fsync amortisation ratio. The plateau moved from 5-25 VUs to 25-50 VUs.
+
+### The before/after that justifies group commit — measured in ONE session
+
+Cross-session throughput comparisons on this host are unreliable (established when Stage 1's 135 vs 83 turned out to be warm-up, not code). So a `WAL_MODE` switch was added and all three strategies were measured **back-to-back, interleaved, 3 runs each**:
+
+| VUs | mode | median ord/s | p50 | p95 |
+|-----|------|-------------|-----|-----|
+| 10 | none (no durability) | 3368.2 | 2.64ms | 4.67ms |
+| 10 | fsync-per-order | 994.2 | 9.35ms | 13.29ms |
+| 10 | group-commit | 2129.1 | 3.77ms | 9.46ms |
+| 25 | none (no durability) | 3380.3 | 6.84ms | 10.72ms |
+| 25 | fsync-per-order | 1015.8 | 23.63ms | 30.95ms |
+| 25 | **group-commit** | **3292.4** | **6.84ms** | **11.17ms** |
+
+**At 25 VUs: fsync-per-order 1016 -> group commit 3292 ord/s, a 3.24x improvement.**
+
+Durability had cost 2365 ord/s (3380 down to 1016). **Group commit recovers 2277 of that — 96.3%.** The latency cost against no-durability is **+0.45ms p95** (10.72 -> 11.17ms). Against fsync-per-order, group commit is *both* 3.24x faster and 2.8x lower latency (30.95 -> 11.17ms p95).
+
+At 10 VUs the recovery is only 47.8%, because avgBatch is ~5-7: with few requests in flight there is less to amortise. **The benefit of group commit scales with load** — which is the right shape, since that is when it is needed.
+
+This also corrected a mistake I nearly shipped: the first group-commit runs measured ~3500 ord/s against Stage 2's recorded ~2127 for *no durability*, i.e. adding fsync appeared to make the system faster. That is impossible, and it was cross-session drift, not a real result. Same-session A/B is why the numbers above can be trusted.
+
+### RUNNING COMPARISON
+
+| Stage | throughput (ord/s) | p95 | durable? |
+|-------|-------------------|-----|----------|
+| Stage 0: Postgres ACID | ~181 | 36.5ms @5VU / 162.1ms @25VU | yes (ACID) |
+| Stage 2: in-memory, no durability | ~2127 | 6.62ms | **no** |
+| Step 1: WAL, fsync-per-order | ~797 | 16.8ms | yes |
+| **Step 2: WAL, group commit** | **~3216** | **11.6ms** | **yes** |
+
+Caveat on the first three rows: they were measured in earlier sessions. The same-session A/B above is the defensible comparison. Cross-session, group commit is **~18x** the Postgres ACID baseline and **~4x** fsync-per-order; same-session at 25 VUs it is **3.24x** fsync-per-order and **97.4%** of the no-durability ceiling.
+
+### Correctness and recovery
+
+`npm test` gained a group-commit section (E) covering conservation, no-negatives, the genuine race, batching, and replay parity. All sections pass:
+
+```
+E. STAGE 3 STEP 2 — group commit (write -> apply -> batch fsync -> ack)
+  (a) conservation      PASS x3
+  (b) no negatives      PASS x2   Maker (user 2) has insufficient SOL: have 1, need 5
+  (c) genuine race      PASS x4   exactly one buyer filled; bob sold exactly 5, not 10
+  (d) batching + durability of acks
+      PASS  every acknowledged order is on disk | acked=200 onDisk=200
+      PASS  fsyncs were amortised across orders | appends=200 fsyncs=4 avgBatch=50.0
+      PASS  sequence numbers are gapless and ordered | first=1 last=200
+  (e) crash recovery    PASS  replayed state IDENTICAL to live | 1162 bytes matched
+
+ALL INVARIANTS HOLD
+```
+
+**Hard kill MID-LOAD** — the case batching specifically puts at risk. 25 VUs, `taskkill /F` at t=4s:
+
+```
+orders ACKNOWLEDGED as filled by k6 (HTTP 200): 13320
+WAL records on disk: 13341
+
+RECOVERY: replayed 13341 WAL records in 28.2ms (13341 applied, 0 rejected)
+trades recovered from log: 13341
+
+  acknowledged to clients : 13320
+  recovered from the log  : 13341
+  VERDICT: PASS - nothing acknowledged-but-lost
+```
+
+The log is a **superset** of what was acknowledged, never a subset. The 21 extra records are orders that were written and fsynced but whose HTTP response never left the process before it was killed — exactly the safe direction to err. Recovery replayed 13,341 records in **28.2ms** (~473k records/sec), rebuilding 15,344 orders, 1,735 resting orders and 13,341 trades with `negativeBalances: 0`.
+
+**Not done (deliberate):** no CRC32, no length-prefixed binary format. JSON lines still cannot self-verify, so a torn trailing record fails replay loudly — `Wal.replay` names this. That failure licenses Step 3.
+
+**Note:** `npx tsc --noEmit` reports 4 pre-existing strict-mode index-access errors in `engine.ts` (present since Stage 2). `tsx` transpiles without typechecking so runtime is unaffected, and `npm test` passes. Not fixed here — out of scope for this step, but worth clearing before the project is called finished.
+
+**Next:** Step 3 — length-prefixed binary format + CRC32 torn-write protection. Human-driven, not autonomous.
