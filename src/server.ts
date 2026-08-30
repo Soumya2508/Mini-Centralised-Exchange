@@ -27,7 +27,7 @@
 
 import express from "express";
 import { MatchingEngine } from "./engine.js";
-import { Wal, GroupCommitWal, DEFAULT_WAL_PATH } from "./wal.js";
+import { Wal, GroupCommitWal, DEFAULT_WAL_PATH, WalFormat } from "./wal.js";
 import { recover } from "./recover.js";
 import { pool } from "./db.js";
 
@@ -48,6 +48,9 @@ const WAL_MODE = process.env.WAL_MODE ?? "group-commit";
 // without matching concurrency just defers to the delay trigger.
 const BATCH_SIZE = Number(process.env.WAL_BATCH_SIZE ?? 32);
 const BATCH_MS = Number(process.env.WAL_BATCH_MS ?? 0);
+// "framed" = Step 3 (length prefix + CRC32). "jsonl" = Step 1/2 format,
+// kept only so both can be measured in ONE session.
+const WAL_FORMAT = (process.env.WAL_FORMAT ?? "framed") as WalFormat;
 
 let engine: MatchingEngine;
 let gcWal: GroupCommitWal | null = null;
@@ -59,6 +62,7 @@ app.get("/health", (_req, res) => {
     engine: engine ? "in-memory" : "not ready",
     durable: WAL_MODE !== "none",
     mode: WAL_MODE,
+    format: WAL_FORMAT,
     batchSize: WAL_MODE === "group-commit" ? BATCH_SIZE : 1,
     batchMs: WAL_MODE === "group-commit" ? BATCH_MS : 0,
     walBytes: Wal.sizeBytes(DEFAULT_WAL_PATH),
@@ -166,9 +170,10 @@ recover(DEFAULT_WAL_PATH)
       gcWal = new GroupCommitWal(DEFAULT_WAL_PATH, r.startSeq, {
         maxBatch: BATCH_SIZE,
         maxDelayMs: BATCH_MS,
+        format: WAL_FORMAT,
       });
     } else {
-      perOrderWal = new Wal(DEFAULT_WAL_PATH, r.startSeq);
+      perOrderWal = new Wal(DEFAULT_WAL_PATH, r.startSeq, WAL_FORMAT);
     }
     if (WAL_MODE === "none") {
       console.warn("  *** WAL_MODE=none — NO DURABILITY. Measurement only. ***");
@@ -179,6 +184,15 @@ recover(DEFAULT_WAL_PATH)
       console.log(`  genesis:  ${r.genesisBalances} balances, ${r.genesisOrders} resting orders (Postgres)`);
       console.log(`  RECOVERY: replayed ${r.recordsReplayed} WAL records in ${r.recoveryMs.toFixed(1)}ms ` +
                   `(${r.appliedOnReplay} applied, ${r.rejectedOnReplay} rejected)`);
+      if (r.discardedBytes > 0) {
+        console.log(`  TORN TAIL: discarded ${r.discardedBytes} trailing bytes (${r.tornReason}) — ` +
+                    `never acknowledged, safe to drop`);
+      }
+      if (r.midFileCorruption) {
+        console.warn(`  *** MID-FILE CORRUPTION (${r.tornReason}) — not a torn tail. ` +
+                     `Records after the damage were NOT recovered. ***`);
+      }
+      console.log(`  WAL fmt:  ${WAL_FORMAT}` + (WAL_FORMAT === "framed" ? " (len + JSON + CRC32)" : " (no torn-write protection)"));
       console.log(`  WAL mode: ${WAL_MODE}` +
                   (WAL_MODE === "group-commit" ? ` (batch=${BATCH_SIZE}, maxDelay=${BATCH_MS}ms)` : ""));
       console.log(`  DURABLE:  write -> apply -> fsync -> ack; nothing acked before its fsync`);
