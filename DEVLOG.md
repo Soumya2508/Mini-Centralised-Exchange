@@ -315,3 +315,56 @@ Why this is expected rather than surprising: every load order is a BUY at one pr
 **Not done (deliberate):** matching not moved in-memory, no WAL, no pool change, `synchronous_commit` reverted to default.
 
 **Licensing question for human:** the wall is row-lock contention on a single head-of-book row, at ~83 ord/s. Postgres row locking is doing exactly what it should. Removing fsync buys 14%; indexing bought stability but no ceiling. The remaining lever that addresses the *actual* dominant cost is removing the round-trip-per-lock model entirely — i.e. single-threaded in-memory matching where the "lock" is just being the only writer. **Does this measurement license Stage 2, or is ~83 ord/s adequate and the honest move to stop?** Human decides.
+
+---
+
+## [2026-08-28] — Stage 1: repeated-measures baseline (settles the 135 vs 83 gap)
+
+**Why:** Stage 0.5 reported ~135 ord/s and Stage 1 reported ~83 on identical code, seed and protocol. A 1.6x gap that ~10% run-to-run variance cannot explain. No code was changed for this entry — measurement only.
+
+**Method:** 34 k6 runs, 15s each, `VUS` levels 1/5/10/25/50, **interleaved** (6 rounds, each round sweeping all five levels in order — not all runs of one level back-to-back). Every run preceded by a `TRUNCATE trades, orders RESTART IDENTITY` + balance reset + re-insert of the 2,003-order resting book, so each run starts from an identical data state. Drift probes at VUs=25 at both the start and end of the session. Match rate was **100.00% on all 34 runs**.
+
+**Per-level steady state (rounds 2-6, n=5 per level; round 1 discarded as cold):**
+
+| VUs | n | median tput | min | max | spread | median p95 |
+|-----|---|------------|-----|-----|--------|-----------|
+| 1 | 5 | 137.1 | 121.9 | 145.3 | 17.1% | 9.2ms |
+| 5 | 5 | 180.2 | 167.0 | 184.8 | 9.9% | 36.5ms |
+| 10 | 5 | 180.9 | 151.0 | 182.5 | 17.4% | 82.5ms |
+| 25 | 5 | **184.2** | 162.3 | 185.3 | 12.5% | 162.1ms |
+| 50 | 5 | 172.2 | 164.4 | 181.2 | 9.8% | 332.9ms |
+
+Plateau pooled across VUs 5/10/25 (n=15): **median 180.9**, min 151.0, max 185.3.
+
+**Explanation of the 1.6x gap: warm-up / host state, not the code.**
+
+Evidence 1 — the stack is strongly warm-up sensitive. Round 1 versus steady-state median, same levels, same session:
+
+```
+  VUs=1    cold=106.5   steady=137.1   cold is 22% lower
+  VUs=5    cold=139.4   steady=180.2   cold is 23% lower
+  VUs=10   cold=137.3   steady=180.9   cold is 24% lower
+  VUs=25   cold=134.1   steady=184.2   cold is 27% lower
+  VUs=50   cold=101.1   steady=172.2   cold is 41% lower
+```
+
+Evidence 2 — **the cold number reproduces the 135 almost exactly.** The start-of-session drift probe, taken on a freshly started Docker Desktop before any warm-up:
+
+```
+  driftA (session start, cold): [132.9, 137.8]  median=135.3
+  driftB (session end, warm):   [172.1, 168.5]  median=170.3
+```
+
+`driftA` median **135.3** against Stage 0.5's reported **135**. Stage 0.5 ran its sweep immediately after starting the stack, with no warm-up — it measured the cold state and reported it as the baseline.
+
+Evidence 3 — direction of drift. Within this session throughput went *up* (135 cold → 181 warm → 170 at end), so there is no monotonic within-session decay. The previous session's slide to 83 was a more severe degradation of a Docker Desktop instance that had been running for hours across dozens of container and volume recreations. That environment no longer exists, so this cause is **inferred, not proven**: what is proven is that identical code, seed and protocol on a freshly restarted Docker Desktop yields ~181, and that the measurement is highly sensitive to stack warmth.
+
+**Both prior figures are superseded.** 135 was a cold-start measurement. 83 was measured on a degraded host. Neither should be quoted.
+
+**AUTHORITATIVE BASELINE: ~181 orders/sec** — median of 15 steady-state runs across the VUs 5-25 plateau (min 151, max 185). p95 at the plateau: **36ms at 5 VUs**, **162ms at 25 VUs**. Throughput is flat from 5 to 25 VUs and falls to 172 at 50 VUs while p95 rises to 333ms.
+
+**Caveats that remain:** measured on a shared Windows host with client, API and Postgres co-resident; per-level spread is 10-17%, so quote 181 as "~180 ord/s", not three significant figures. Any future measurement must discard at least one warm-up round or it will under-report by 20-40%.
+
+**Mechanism findings from the prior entry are unaffected** — lock contention dominating (54.2% of backend samples) versus fsync (0.15%), and the index removing decay rather than the ceiling, are ratios measured within single sessions and do not depend on the absolute scale.
+
+**Not done:** Stage 2 not started. No code changed in this entry.

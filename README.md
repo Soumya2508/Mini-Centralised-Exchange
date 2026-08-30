@@ -19,7 +19,7 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 
 ### Current status: **Stage 1 complete — wall profiled, not yet optimised**
 
-Stage 0 is a correct transactional baseline with a committed invariant harness. Stage 1 profiled the wall: after adding the missing index, the ACID path plateaus at **~83 orders/sec**, and the dominant cost is **row-lock contention on the head-of-book row** (54% of backend samples), not fsync (0.15%). Stages 2 → 4 are not started, and Stage 2 is not yet licensed — see [DEVLOG.md](DEVLOG.md).
+Stage 0 is a correct transactional baseline with a committed invariant harness. Stage 1 profiled the wall: after adding the missing index, the ACID path plateaus at **~180 orders/sec** (median of 15 steady-state runs), and the dominant cost is **row-lock contention on the head-of-book row** (54% of backend samples), not fsync (0.15%). Stages 2 → 4 are not started, and Stage 2 is not yet licensed — see [DEVLOG.md](DEVLOG.md).
 
 **What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no in-memory matching engine. Durability in Stage 0 is whatever Postgres itself provides via its own ACID guarantees — nothing custom has been built on top. The Stage 0.5 numbers below are a *baseline measurement*, not an optimisation result: nothing has been tuned, and the dominant cost has not yet been profiled.
 
@@ -155,26 +155,37 @@ totals: SOL=250.00000000  USDC=50000.00000000   (unchanged)
 
 ---
 
-## Stage 0.5 — Measured baseline (no tuning)
+## Measured baseline — ~180 orders/sec
 
-Load generated with k6 against `POST /order`, using a generated seed of 200 funded users and a 2,000-order resting sell book (`db/seed-load.sql`, `loadtest/order-load.js`). Orders are constructed to genuinely **match and commit** — `match_rate` was **100% at every level**, so these numbers measure the real transactional path, not rejection speed.
+Load generated with k6 against `POST /order`, using a generated seed of 200 funded users and a 2,000-order resting sell book (`db/seed-load.sql`, `loadtest/order-load.js`). Orders are constructed to genuinely **match and commit** — `match_rate` was **100% on all 34 runs**, so these numbers measure the real transactional path, not rejection speed.
 
-| VUs | throughput (ord/s) | p50 | p95 | p99 | error% | match% |
-|-----|-------------------|-----|-----|-----|--------|--------|
-| 1 | 56.95 | 16.04ms | 33.19ms | 42.54ms | 0.00% | 100% |
-| 5 | 135.05 | 31.30ms | 67.59ms | 174.14ms | 0.00% | 100% |
-| 10 | 138.17 | 28.71ms | 198.26ms | 865.44ms | 0.00% | 100% |
-| 25 | 133.21 | 170.41ms | 284.74ms | 360.68ms | 0.00% | 100% |
-| 50 | 133.23 | 342.09ms | 576.92ms | 690.98ms | 0.00% | 100% |
-| 100 | 140.41 | 675.72ms | 888.67ms | 1.04s | 0.00% | 100% |
+Figures below are **medians of 5 interleaved runs per level**, each against a freshly reset and reseeded database. Single-run numbers are not quoted.
 
-**Throughput plateaus from 5 VUs onward.** (Stage 1 re-measurement put the plateau at ~83 ord/s on the same code; run-to-run variance is ~10% and this 135 figure did not reproduce — treat Stage 1's numbers as authoritative.) Going from 5 to 100 concurrent clients bought no extra throughput while p50 latency grew ~21x. Past ~5 concurrent clients, requests queue rather than execute.
+| VUs | median tput (ord/s) | min | max | spread | median p95 |
+|-----|--------------------|-----|-----|--------|-----------|
+| 1 | 137.1 | 121.9 | 145.3 | 17.1% | 9.2ms |
+| 5 | 180.2 | 167.0 | 184.8 | 9.9% | 36.5ms |
+| 10 | 180.9 | 151.0 | 182.5 | 17.4% | 82.5ms |
+| 25 | **184.2** | 162.3 | 185.3 | 12.5% | 162.1ms |
+| 50 | 172.2 | 164.4 | 181.2 | 9.8% | 332.9ms |
 
-Zero errors and **zero deadlocks** at every level — the deterministic lock ordering holds under sustained load. 15,378 trades committed across the sweep with `negative_balances = 0` afterwards.
+**Authoritative baseline: ~180 ord/s**, pooled median across the VUs 5-25 plateau (n=15, min 151, max 185). Throughput is flat from 5 to 25 VUs — going from 5 to 25 concurrent clients buys nothing while p95 grows 36ms → 162ms. A single client already reaches 137 ord/s, so the ceiling is only ~1.3x one client.
 
-**No conclusion is drawn yet about *why* the wall is there.** Candidate causes — fsync-per-commit, row-lock contention on the head of the book, the unindexed match predicate on a table growing by one row per request, or client/server round-trips — have not been separated. That profiling is Stage 1, and it is what licenses any optimisation.
+Zero errors and **zero deadlocks** across all 34 runs — the deterministic lock ordering holds under sustained load.
 
-Reproduce:
+> **On earlier figures.** Two superseded numbers appear in the git history: 135 ord/s (Stage 0.5) and 83 ord/s (first Stage 1 pass). Neither should be quoted. The stack is strongly warm-up sensitive — the first run of a session measures 22-41% low — and a cold drift probe here reproduced **135.3**, matching the Stage 0.5 figure and identifying it as a cold-start measurement. The 83 was measured on a Docker host degraded by hours of container churn. Full evidence in [DEVLOG.md](DEVLOG.md).
+
+### Why the wall is where it is
+
+Every load order is a buy at one price against one book, so all takers contend for the **head-of-book row** — a single serialisation point by construction. Profiling the remaining wall (60 samples of `pg_stat_activity` under load, 660 backend observations):
+
+- **54.2%** of samples in lock waits (`Lock|tuple` 46.4% + `Lock|transactionid` 7.9%)
+- 11.4% actually executing
+- **0.15%** fsync (`IO|WALSync`)
+
+Cross-checked with an alternating `synchronous_commit` A/B (diagnostic only, reverted): turning off durability entirely buys only **~14%**. The pool is not exhausted — ~3.2 of 10 connections sat idle under load — so it was left at its default.
+
+Reproduce (discard at least one warm-up round):
 
 ```bash
 docker compose down -v && docker compose up -d
