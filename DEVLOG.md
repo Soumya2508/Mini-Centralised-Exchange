@@ -441,3 +441,135 @@ The exchange holds **zero** database connections while serving orders — the po
 **Still open:** Bug 5 (single-level match) — unchanged, deliberate scope cut, carried into the in-memory engine as-is.
 
 **Next:** Stage 3 (WAL) — restore durability without reintroducing the Stage 1 wall. Human-driven, not autonomous.
+
+---
+
+## [2026-08-28] — Stage 3 Step 1: minimal WAL (append-before-execute, fsync-per-order, crash recovery)
+
+**Change:** durability restored on top of the in-memory engine by a sequential append-only log (`src/wal.ts`, `src/recover.ts`) instead of a transactional database round-trip. Order path is now:
+
+```
+validate request shape  ->  append JSON line to WAL  ->  fsync  ->  apply to engine
+```
+
+The fsync is the durability point. If the process dies after the fsync and before the apply, replay re-applies the order; if it dies during the write, the record never lands and memory never saw it either. **Memory can never be ahead of the log.**
+
+**What is logged: commands, not effects.** Each line is the submitted order, not the balance deltas it produced. Recovery is deterministic re-execution against a fresh engine. This is sound only because `processOrder()` is synchronous and deterministic — no clock, no randomness, no I/O, no concurrency. Cost of the choice: recovery is O(orders) rather than O(state), and the matching logic can never change in a way that alters replay of old records without a log version bump. Benefit: records are tiny and the log is readable with `cat`.
+
+Rejected orders are logged too — they were genuinely submitted, and replay rejects them identically. Malformed HTTP requests are rejected *before* the log and never enter it.
+
+**Deviation from the brief, flagged:** the brief asked for a Docker volume. This app is a host process (only Postgres is containerised), so a Docker volume does not apply to it. The log is a host file (`data/wal.log`, overridable via `WAL_PATH`), which delivers the property that mattered — survives process kill, container restart and reboot.
+
+**Genesis split:** Postgres supplies the t=0 seeded state; the WAL is authoritative for everything after boot. That is sound only while the seed is fixed. A real system would pin this with a snapshot or log genesis as record 0. Called out rather than pretended away.
+
+### Crash recovery — PROVED, twice, with a hard kill
+
+The log is human-readable by design at this step:
+
+```
+{"seq":1,"ts":1788122931822,"userId":1,"symbol":"SOL_USDC","side":"buy","price":100,"quantity":5}
+{"seq":2,"ts":1788122931870,"userId":5,"symbol":"SOL_USDC","side":"buy","price":100,"quantity":3}
+{"seq":3,"ts":1788122931930,"userId":1,"symbol":"SOL_USDC","side":"buy","price":100,"quantity":4}
+{"seq":4,"ts":1788122931985,"userId":3,"symbol":"SOL_USDC","side":"buy","price":95,"quantity":2}
+{"seq":5,"ts":1788122932038,"userId":2,"symbol":"SOL_USDC","side":"sell","price":110,"quantity":6}
+{"seq":6,"ts":1788122932100,"userId":4,"symbol":"SOL_USDC","side":"buy","price":50,"quantity":1}
+```
+
+`taskkill /F` — a hard kill, no graceful shutdown, no flush:
+
+```
+SUCCESS: The process with PID 19072 has been terminated.
+listeners on 3000 after kill: 0
+server responds? DEAD (expected)
+```
+
+Restart, rebuilding state purely from genesis + log:
+
+```
+  genesis:  10 balances, 3 resting orders (Postgres)
+  RECOVERY: replayed 6 WAL records in 0.3ms (2 applied, 4 rejected)
+  WAL:      data/wal.log (587 bytes), resuming at seq 7
+```
+
+A second cycle compared **full** snapshots — `/state` plus every order plus every trade:
+
+```
+=== FULL STATE DIFF (state + every order + every trade) ===
+  IDENTICAL — byte-for-byte across state, orders and trades
+  compared 1346 bytes
+```
+
+Recovered book after the second crash, rebuilt from nothing but the log:
+
+```
+  id=1 u=2 sell p=   90 qty=5 filled=5 filled
+  id=2 u=3 sell p=   95 qty=3 filled=3 filled
+  id=3 u=4 sell p=  110 qty=8 filled=7 partial   <- partial state survived
+  id=4 u=1 buy  p=  100 qty=5 filled=5 filled
+  id=5 u=5 buy  p=  100 qty=3 filled=3 filled
+  id=6 u=2 buy  p=  110 qty=4 filled=4 filled
+  id=7 u=5 buy  p=  115 qty=3 filled=3 filled
+```
+
+Recovery time: **0.3ms for 9 records**.
+
+**Correctness:** `npm test` now covers four sections — Stage 0 (Postgres), Stage 2 (RAM), parity between them, and Stage 3 (WAL). All pass:
+
+```
+D. STAGE 3 STEP 1 — WAL-backed engine (append + fsync, then apply)
+  (a) conservation
+  PASS  two trades executed | alice={"ok":true,"qty":5,"price":90} eve={"ok":true,"qty":3,"price":95}
+  PASS  total unchanged for USDC | before=50000  after=50000
+  PASS  total unchanged for SOL  | before=250    after=250
+  PASS  every order was fsync'd individually | appends=2 fsyncs=2
+  (b) no negative balances
+  PASS  insolvent maker is rejected | Maker (user 2) has insufficient SOL: have 1, need 5
+  PASS  rejected order is STILL in the log
+  PASS  no negative balances anywhere
+  (c) genuine race — Promise.all, ONE limited resting order
+  PASS  exactly one buyer filled
+  PASS  bob sold exactly 5 SOL, not 10
+  PASS  total unchanged for USDC/SOL across the race
+  PASS  no negative balances after race
+  (d) crash recovery — replay rebuilds identical state
+  PASS  log holds every submitted order | records=6 submitted=6
+  PASS  replayed state is IDENTICAL to live state | 1162 bytes of state matched
+
+ALL INVARIANTS HOLD
+```
+
+### Throughput
+
+Same protocol as Stages 1 and 2 — 25 runs, 15s, interleaved, round 1 discarded, fresh DB **and fresh WAL** per run (the WAL now persists across restarts, so it must be cleared or state carries between runs).
+
+| VUs | n | median ord/s | min | max | spread | p50 | p95 | p99 | vs RAM | vs Postgres |
+|-----|---|-------------|-----|-----|--------|-----|-----|-----|--------|------------|
+| 1 | 4 | 260.3 | 242.5 | 275.8 | 12.8% | 2.49ms | 12.11ms | 22.15ms | 0.64x | 1.9x |
+| 5 | 4 | 782.4 | 698.0 | 798.1 | 12.8% | 5.86ms | 9.77ms | 14.91ms | 0.36x | 4.3x |
+| 10 | 4 | **805.2** | 774.3 | 809.0 | 4.3% | 11.93ms | 16.82ms | 21.85ms | 0.39x | 4.5x |
+| 25 | 4 | 791.2 | 765.3 | 813.4 | 6.1% | 30.87ms | 39.88ms | 46.48ms | 0.39x | 4.3x |
+| 50 | 4 | 796.0 | 647.7 | 810.0 | 20.4% | 62.39ms | 76.28ms | 84.77ms | 0.39x | 4.6x |
+
+Plateau pooled (VUs 5/10/25, n=12): **median 796.7 ord/s**, min 698.0, max 813.4, p95 median **16.82ms**. Match rate 100.00% on every run.
+
+### RUNNING COMPARISON
+
+| Stage | throughput (ord/s) | p95 at plateau | durable? |
+|-------|-------------------|----------------|----------|
+| Stage 0: Postgres ACID | ~181 | 36.5ms @5VU / 162.1ms @25VU | yes (ACID) |
+| Stage 2: in-memory, no durability | ~2127 | 6.62ms | **NO** |
+| Step 1: WAL, fsync-per-order | **~797** | 16.82ms | yes (fsync per order) |
+
+**What per-order fsync cost: 796.7 / 2126.8 = 37.5% of in-memory throughput. Durability gave back 62.5% of the Stage 2 speedup** — 2127 down to 797 ord/s. The plateau sits at ~800 fsyncs/sec, which is the disk synchronous-write rate, not a CPU or lock limit: throughput is flat from 5 to 50 VUs while latency scales linearly, the signature of a fixed-rate serialised resource.
+
+Still **4.4x faster than the durable Postgres baseline** — the same durability guarantee at a sequential append cost instead of a transactional round-trip cost. That is the whole Stage 3 thesis, and it is now measured rather than asserted.
+
+**This licenses Step 2 (group commit):** if one fsync per order costs 62.5% of throughput, batching N orders per fsync should recover most of it, trading a sliver of latency for throughput.
+
+### Measurement bug caught (worth recording)
+
+The first WAL sweep returned `match_rate = 0.00%` on every run. Cause: the `docker compose down -v` used for the crash test destroyed the 200 seeded load users, so `reset.sql` recreated no load book and every order was rejected for a missing balance. Had `match_rate` not been asserted in the harness, this would have been reported as fast "throughput" that was really rejection speed — the exact failure mode that made the original Stage 0 Test 4 pass for the wrong reason. Re-seeded and re-ran; the numbers above are from the corrected run.
+
+**Not done (deliberate):** no group commit (Step 2), no CRC32 or length-prefixed binary format (Step 3). JSON lines cannot self-verify, so a torn trailing record currently fails replay loudly rather than being discarded — `Wal.replay` names this explicitly. That failure is what licenses Step 3.
+
+**Next:** Step 2 — group commit, licensed by the 62.5% cost measured here. Human-driven, not autonomous.

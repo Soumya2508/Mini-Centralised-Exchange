@@ -14,18 +14,22 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 | **Stage 0.5** ✅ | Load harness (k6) | Must produce my own numbers, not assert textbook ones |
 | **Stage 1** ✅ | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
 | **Stage 2** ✅ | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
-| **Stage 3** | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
+| **Stage 3** ◐ | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
 | **Stage 4** | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
 
-### Current status: **Stage 2 complete — in-memory matching, NO DURABILITY**
+### Current status: **Stage 3 Step 1 — durable again, via a write-ahead log**
 
-Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wall at **~180 orders/sec**, dominated by **row-lock contention** (54.2% of backend samples) rather than fsync (0.15%). Stage 2 acted on that: matching now runs in a **single-threaded in-memory engine** at **~2,127 orders/sec (11.8x)**, with lock contention measured at **zero**.
+Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wall at **~181 orders/sec**, dominated by **row-lock contention** (54.2% of backend samples) rather than fsync (0.15%). Stage 2 moved matching into a **single-threaded in-memory engine** — **~2,127 ord/s (11.8x)**, lock contention zero, but durability deliberately deleted. Stage 3 Step 1 rebuilds durability by another route: a **write-ahead log**, appended and fsync'd *before* each order touches memory, with crash recovery by deterministic replay — **~797 ord/s (4.4x the Postgres baseline)**.
 
-> ### ⚠️ This build has NO DURABILITY
->
-> Stage 2 deliberately traded away Stage 0's ACID guarantees. **A crash loses every balance, resting order and trade since boot** — there is no log, no snapshot, no recovery. This is the intended consequence of removing the transaction from the hot path, not a bug, and it is what **Stage 3 (a write-ahead log with group commit and crash recovery)** exists to restore. Do not treat this as production-shaped.
+| Stage | throughput (ord/s) | p95 at plateau | durable? |
+|-------|-------------------|----------------|----------|
+| Stage 0: Postgres ACID | ~181 | 36.5ms @5VU / 162.1ms @25VU | yes (ACID) |
+| Stage 2: in-memory | ~2127 | 6.62ms | **no** |
+| Stage 3 Step 1: WAL, fsync-per-order | **~797** | 16.82ms | yes |
 
-Stages 3 → 4 are not started.
+Per-order fsync costs **62.5% of the in-memory speedup** (2127 → 797) and buys back full crash durability — still **4.4x** the ACID baseline, because the cost is a sequential append rather than a transactional round-trip. That measured 62.5% is what licenses group commit (Step 2).
+
+Steps 2 (group commit) and 3 (CRC32 + length-prefixed binary format) are **not** built. Stage 4 is not started.
 
 **What this project does NOT have yet:** no custom WAL, no group commit, no CRC32 torn-write protection, no crash-recovery replay, no async projection. The Stage 0 Postgres path still exists in `src/orderProcessor.ts` and is still exercised by `npm test`, but the served hot path is now the in-memory engine and is **not durable**.
 
@@ -382,7 +386,7 @@ A matching engine for one instrument is fundamentally **single-writer** — all 
 - [x] **Stage 0.5** — Load harness (k6) + measured baseline (no tuning)
 - [x] **Stage 1** — Profiled the wall: index separated, dominant cost = row-lock contention
 - [x] **Stage 2** — In-memory matching (single-threaded, lock-free) — 11.8x, durability dropped by design
-- [ ] **Stage 3** — Custom WAL (group commit, CRC32 torn-write protection, crash recovery)
+- [◐] **Stage 3** — Custom WAL: Step 1 done (append-before-execute, fsync-per-order, crash recovery). Steps 2 (group commit) and 3 (CRC32 torn-write) pending.
 - [ ] **Stage 4** — Async projection to Postgres read-model (CQRS)
 
 ## License
