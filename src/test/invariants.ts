@@ -20,9 +20,13 @@
 // process can silently serve old code and make a broken build look
 // green. Importing guarantees the code under test is the code on disk.
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { pool } from "../db.js";
 import { processOrder as dbProcessOrder } from "../orderProcessor.js";
 import { MatchingEngine } from "../engine.js";
+import { Wal } from "../wal.js";
 
 const SYMBOL = "SOL_USDC";
 const ALICE = 1, BOB = 2, CAROL = 3, DAVE = 4, EVE = 5;
@@ -253,17 +257,130 @@ async function testParity(): Promise<void> {
   }
 }
 
+// ═══════════ D. Stage 3 Step 1 — WAL-backed engine ═══════════
+//
+// Same invariants again, but every order goes through the real
+// write-ahead path: append + fsync to disk BEFORE touching memory.
+// Then the log is replayed into a fresh engine and the rebuilt state
+// is compared against the live one — durability proved, not assumed.
+
+/** The server's order path: durable first, then apply. */
+async function walPlace(
+  e: MatchingEngine, w: Wal, userId: number,
+  side: "buy" | "sell", price: number, quantity: number
+): Promise<Outcome> {
+  w.append({ userId, symbol: SYMBOL, side, price, quantity }); // fsync'd
+  try {
+    const t = e.processOrder({ userId, symbol: SYMBOL, side, price, quantity });
+    return { ok: true, qty: t.quantity, price: t.price };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+/** Rebuild an engine from genesis + log, exactly as recover.ts does. */
+function replayInto(walPath: string): MatchingEngine {
+  const e = makeEngine();
+  for (const r of Wal.replay(walPath)) {
+    try { e.processOrder(r); } catch { /* deterministic rejection */ }
+  }
+  return e;
+}
+
+/** Stable fingerprint of everything the engine holds. */
+const fingerprint = (e: MatchingEngine): string =>
+  JSON.stringify({
+    totals: Object.fromEntries(e.totals()),
+    orders: e.getOrders(),
+    trades: e.getTrades(),
+  });
+
+async function testWalEngine(): Promise<void> {
+  console.log("\nD. STAGE 3 STEP 1 — WAL-backed engine (append + fsync, then apply)");
+  const tmp = (n: string) => path.join(os.tmpdir(), `inv-wal-${process.pid}-${n}.log`);
+
+  console.log("\n  (a) conservation");
+  let p = tmp("a"); fs.rmSync(p, { force: true });
+  let e = makeEngine(); let w = new Wal(p, 1);
+  const before = memTotals(e);
+  const t1 = await walPlace(e, w, ALICE, "buy", 100, 5);
+  const t2 = await walPlace(e, w, EVE, "buy", 100, 3);
+  const after = memTotals(e);
+  assert("two trades executed", t1.ok && t2.ok, `alice=${JSON.stringify(t1)} eve=${JSON.stringify(t2)}`);
+  for (const asset of Object.keys(before)) {
+    assert(`total unchanged for ${asset}`, before[asset] === after[asset],
+      `before=${before[asset]}  after=${after[asset]}`);
+  }
+  assert("every order was fsync'd individually", w.fsyncCount === w.appendCount && w.fsyncCount === 2,
+    `appends=${w.appendCount} fsyncs=${w.fsyncCount}`);
+  w.close();
+
+  console.log("\n  (b) no negative balances");
+  p = tmp("b"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new Wal(p, 1);
+  e.setBalance(BOB, "SOL", 1);
+  const r = await walPlace(e, w, ALICE, "buy", 100, 5);
+  assert("insolvent maker is rejected", !r.ok, r.ok ? `unexpectedly filled ${r.qty}` : r.error);
+  assert("rejected order is STILL in the log", Wal.replay(p).length === 1,
+    "a submitted order is logged whether or not it fills");
+  assert("no negative balances anywhere", e.negativeBalanceCount() === 0);
+  w.close();
+
+  console.log("\n  (c) genuine race — Promise.all, ONE limited resting order");
+  p = tmp("c"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new Wal(p, 1);
+  const beforeRace = memTotals(e);
+  const [a, ev] = await Promise.all([
+    walPlace(e, w, ALICE, "buy", 90, 5),
+    walPlace(e, w, EVE, "buy", 90, 5),
+  ]);
+  assert("exactly one buyer filled", [a, ev].filter((x) => x.ok).length === 1,
+    `alice=${JSON.stringify(a)}  eve=${JSON.stringify(ev)}`);
+  assert("bob sold exactly 5 SOL, not 10", e.getBalance(BOB, "SOL") === 45);
+  const afterRace = memTotals(e);
+  for (const asset of Object.keys(beforeRace)) {
+    assert(`total unchanged for ${asset} across the race`, beforeRace[asset] === afterRace[asset]);
+  }
+  assert("no negative balances after race", e.negativeBalanceCount() === 0);
+  w.close();
+
+  console.log("\n  (d) crash recovery — replay rebuilds identical state");
+  p = tmp("d"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new Wal(p, 1);
+  const script: Array<[number, "buy" | "sell", number, number]> = [
+    [ALICE, "buy", 100, 5],   // fills bob @90
+    [EVE, "buy", 100, 3],     // fills carol @95
+    [ALICE, "buy", 90, 10],   // no match at 90 -> rejected
+    [BOB, "buy", 110, 4],     // fills dave @110
+    [CAROL, "sell", 200, 1],  // no buy that high -> rejected
+    [DAVE, "buy", 110, 6],    // partial against dave's own remainder
+  ];
+  for (const [u, side, price, qty] of script) await walPlace(e, w, u, side, price, qty);
+  w.close();
+
+  const live = fingerprint(e);
+  const rebuilt = fingerprint(replayInto(p));
+  assert("log holds every submitted order", Wal.replay(p).length === script.length,
+    `records=${Wal.replay(p).length} submitted=${script.length}`);
+  assert("replayed state is IDENTICAL to live state", live === rebuilt,
+    live === rebuilt
+      ? `${live.length} bytes of state matched (balances + orders + trades)`
+      : `live    : ${live.slice(0, 200)}\n         rebuilt: ${rebuilt.slice(0, 200)}`);
+  fs.rmSync(p, { force: true });
+}
+
 // ═══════════ main ═══════════
 
 async function main(): Promise<void> {
-  console.log("Invariant harness — Stage 0 (Postgres) + Stage 2 (in-memory)");
+  console.log("Invariant harness — Stage 0 (Postgres) + Stage 2 (RAM) + Stage 3 Step 1 (WAL)");
   console.log("============================================================");
-  console.log("NOTE: Stage 2 has NO durability. A crash loses all in-memory");
-  console.log("      state. Restoring it is Stage 3's job, not this one.");
+  console.log("NOTE: Stage 3 Step 1 restores durability via append+fsync-before-apply.");
+  console.log("      No group commit yet (Step 2), no torn-write protection yet (Step 3).");
   try {
     await testDatabaseEngine();
     await testMemoryEngine();
     await testParity();
+    await testWalEngine();
   } finally {
     await dbReset();
     await pool.end();
