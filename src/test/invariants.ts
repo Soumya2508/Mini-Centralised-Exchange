@@ -26,7 +26,7 @@ import path from "node:path";
 import { pool } from "../db.js";
 import { processOrder as dbProcessOrder } from "../orderProcessor.js";
 import { MatchingEngine } from "../engine.js";
-import { Wal } from "../wal.js";
+import { Wal, GroupCommitWal } from "../wal.js";
 
 const SYMBOL = "SOL_USDC";
 const ALICE = 1, BOB = 2, CAROL = 3, DAVE = 4, EVE = 5;
@@ -369,18 +369,127 @@ async function testWalEngine(): Promise<void> {
   fs.rmSync(p, { force: true });
 }
 
+// ═══════════ E. Stage 3 Step 2 — group commit ═══════════
+//
+// Same invariants under batched fsync, plus the property that batching
+// specifically puts at risk: anything ACKNOWLEDGED must be on disk.
+
+/** Server order path under group commit: write -> apply -> await fsync -> ack. */
+async function gcPlace(
+  e: MatchingEngine, w: GroupCommitWal, userId: number,
+  side: "buy" | "sell", price: number, quantity: number
+): Promise<Outcome> {
+  const { durable } = w.appendAndAwaitDurable({ userId, symbol: SYMBOL, side, price, quantity });
+  let out: Outcome;
+  try {
+    const t = e.processOrder({ userId, symbol: SYMBOL, side, price, quantity });
+    out = { ok: true, qty: t.quantity, price: t.price };
+  } catch (err) {
+    out = { ok: false, error: (err as Error).message };
+  }
+  await durable;  // the acknowledgement point
+  return out;
+}
+
+async function testGroupCommit(): Promise<void> {
+  console.log("\nE. STAGE 3 STEP 2 — group commit (write -> apply -> batch fsync -> ack)");
+  const tmp = (n: string) => path.join(os.tmpdir(), `inv-gc-${process.pid}-${n}.log`);
+
+  console.log("\n  (a) conservation");
+  let p = tmp("a"); fs.rmSync(p, { force: true });
+  let e = makeEngine();
+  let w = new GroupCommitWal(p, 1, { maxBatch: 64, maxDelayMs: 2 });
+  const before = memTotals(e);
+  const [t1, t2] = await Promise.all([
+    gcPlace(e, w, ALICE, "buy", 100, 5),
+    gcPlace(e, w, EVE, "buy", 100, 3),
+  ]);
+  const after = memTotals(e);
+  assert("two trades executed", t1.ok && t2.ok, `alice=${JSON.stringify(t1)} eve=${JSON.stringify(t2)}`);
+  for (const asset of Object.keys(before)) {
+    assert(`total unchanged for ${asset}`, before[asset] === after[asset],
+      `before=${before[asset]}  after=${after[asset]}`);
+  }
+  w.close();
+
+  console.log("\n  (b) no negative balances");
+  p = tmp("b"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new GroupCommitWal(p, 1, { maxBatch: 64, maxDelayMs: 2 });
+  e.setBalance(BOB, "SOL", 1);
+  const r = await gcPlace(e, w, ALICE, "buy", 100, 5);
+  assert("insolvent maker is rejected", !r.ok, r.ok ? `unexpectedly filled ${r.qty}` : r.error);
+  assert("no negative balances anywhere", e.negativeBalanceCount() === 0);
+  w.close();
+
+  console.log("\n  (c) genuine race — Promise.all, ONE limited resting order");
+  p = tmp("c"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new GroupCommitWal(p, 1, { maxBatch: 64, maxDelayMs: 2 });
+  const beforeRace = memTotals(e);
+  const [a, ev] = await Promise.all([
+    gcPlace(e, w, ALICE, "buy", 90, 5),
+    gcPlace(e, w, EVE, "buy", 90, 5),
+  ]);
+  assert("exactly one buyer filled", [a, ev].filter((x) => x.ok).length === 1,
+    `alice=${JSON.stringify(a)}  eve=${JSON.stringify(ev)}`);
+  assert("bob sold exactly 5 SOL, not 10", e.getBalance(BOB, "SOL") === 45);
+  const afterRace = memTotals(e);
+  for (const asset of Object.keys(beforeRace)) {
+    assert(`total unchanged for ${asset} across the race`, beforeRace[asset] === afterRace[asset]);
+  }
+  w.close();
+
+  console.log("\n  (d) batching actually happened, and nothing acked is missing from the log");
+  p = tmp("d"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new GroupCommitWal(p, 1, { maxBatch: 64, maxDelayMs: 5 });
+  const N = 200;
+  const jobs: Array<Promise<Outcome>> = [];
+  for (let i = 0; i < N; i++) {
+    jobs.push(gcPlace(e, w, (i % 5) + 1, "buy", 110, 1));
+  }
+  await Promise.all(jobs);           // every one of these is ACKNOWLEDGED
+  const recs = Wal.replay(p);        // read back what is actually on disk
+
+  assert("every acknowledged order is on disk", recs.length === N,
+    `acked=${N} onDisk=${recs.length}`);
+  assert("fsyncs were amortised across orders", w.fsyncCount < w.appendCount,
+    `appends=${w.appendCount} fsyncs=${w.fsyncCount} avgBatch=${w.averageBatchSize.toFixed(1)}`);
+  assert("sequence numbers are gapless and ordered",
+    recs.every((rec, i) => rec.seq === i + 1),
+    `first=${recs[0]?.seq} last=${recs[recs.length - 1]?.seq}`);
+  w.close();
+
+  console.log("\n  (e) crash recovery — replay rebuilds identical state");
+  p = tmp("e"); fs.rmSync(p, { force: true });
+  e = makeEngine(); w = new GroupCommitWal(p, 1, { maxBatch: 8, maxDelayMs: 2 });
+  const script: Array<[number, "buy" | "sell", number, number]> = [
+    [ALICE, "buy", 100, 5], [EVE, "buy", 100, 3], [ALICE, "buy", 90, 10],
+    [BOB, "buy", 110, 4], [CAROL, "sell", 200, 1], [DAVE, "buy", 110, 6],
+  ];
+  await Promise.all(script.map(([u, side, price, qty]) => gcPlace(e, w, u, side, price, qty)));
+  w.close();
+
+  const live = fingerprint(e);
+  const rebuilt = fingerprint(replayInto(p));
+  assert("replayed state is IDENTICAL to live state", live === rebuilt,
+    live === rebuilt
+      ? `${live.length} bytes of state matched (balances + orders + trades)`
+      : `live    : ${live.slice(0, 200)}\n         rebuilt: ${rebuilt.slice(0, 200)}`);
+  fs.rmSync(p, { force: true });
+}
+
 // ═══════════ main ═══════════
 
 async function main(): Promise<void> {
   console.log("Invariant harness — Stage 0 (Postgres) + Stage 2 (RAM) + Stage 3 Step 1 (WAL)");
   console.log("============================================================");
   console.log("NOTE: Stage 3 Step 1 restores durability via append+fsync-before-apply.");
-  console.log("      No group commit yet (Step 2), no torn-write protection yet (Step 3).");
+  console.log("      Step 2 adds group commit. No torn-write protection yet (Step 3).");
   try {
     await testDatabaseEngine();
     await testMemoryEngine();
     await testParity();
     await testWalEngine();
+    await testGroupCommit();
   } finally {
     await dbReset();
     await pool.end();

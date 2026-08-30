@@ -163,3 +163,165 @@ export class Wal {
     return fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
   }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Stage 3, Step 2 — GROUP COMMIT
+// ═══════════════════════════════════════════════════════════════
+//
+// Step 1 measured a hard ceiling: ~800 fsync/s, flat from 5 to 50
+// concurrent clients while latency scaled linearly. That is the disk's
+// serialised synchronous-write rate. One fsync per order cannot beat
+// it, no matter how many clients push.
+//
+// Group commit breaks the ceiling by amortising: many orders share one
+// fsync. Throughput stops being (fsync rate) and becomes
+// (fsync rate x batch size).
+//
+// ── Ordering of operations (this is the whole correctness story) ──
+//
+//   1. write()  the record to the file   <- ordered, NOT yet durable
+//   2. apply    the order to the engine
+//   3. fsync    once per batch           <- the durability point
+//   4. ACK      the client
+//
+// This is the model Postgres uses: a backend does its work and writes
+// WAL records, then blocks at COMMIT until the WAL is flushed; several
+// backends waiting on the same flush is exactly group commit.
+//
+// Why it is still append-before-execute: the record is written to the
+// log BEFORE the order touches memory (step 1 precedes step 2), so this
+// is never apply-then-log. And nothing is ever ACKNOWLEDGED before its
+// fsync (step 3 precedes step 4).
+//
+// Why "applied but not yet fsynced" is safe: that state exists only in
+// RAM. If the process dies there, memory dies with it, and recovery
+// replays a log that simply lacks the order — as if it never arrived.
+// The client was never told otherwise, because the ack had not been
+// sent. There is no acknowledged-but-lost window.
+//
+// Why there can be no HOLE in the log: writes append in call order and
+// a batch fsync durably commits a PREFIX of the file. If order Y is
+// durable then every order written before it is durable too, so replay
+// can never see Y without X.
+//
+// ── The tradeoff being made ────────────────────────────────────
+//
+// Latency is traded for throughput. An order that arrives just after a
+// flush waits up to maxDelayMs before its batch goes out. That wait is
+// the cost; the payoff is that the fsync is shared. Under load the wait
+// is usually far shorter than maxDelayMs because the size threshold
+// fires first.
+//
+// FORMAT IS UNCHANGED from Step 1 — still JSON lines, still no
+// self-verification. Torn-write protection is Step 3.
+
+export interface GroupCommitOptions {
+  /** Flush once this many records are buffered. */
+  maxBatch?: number;
+  /** Flush at most this long after the first record in a batch.
+   *  0 means "flush at the end of the current event-loop turn". */
+  maxDelayMs?: number;
+}
+
+export class GroupCommitWal {
+  private fd: number;
+  private nextSeq: number;
+  private waiters: Array<() => void> = [];
+  private timer: NodeJS.Timeout | null = null;
+  private immediate: NodeJS.Immediate | null = null;
+
+  public appendCount = 0;
+  public fsyncCount = 0;
+  public batchSizes: number[] = [];
+
+  readonly maxBatch: number;
+  readonly maxDelayMs: number;
+
+  constructor(
+    private filePath: string = DEFAULT_WAL_PATH,
+    startSeq = 1,
+    opts: GroupCommitOptions = {}
+  ) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    this.fd = fs.openSync(filePath, "a");
+    this.nextSeq = startSeq;
+    this.maxBatch = opts.maxBatch ?? 64;
+    this.maxDelayMs = opts.maxDelayMs ?? 2;
+  }
+
+  /**
+   * Write the record to the log (ordered, not yet durable) and return a
+   * promise that resolves once it has been fsynced. The caller applies
+   * the order to the engine immediately, but must await `durable`
+   * before acknowledging anything to the client.
+   */
+  appendAndAwaitDurable(o: {
+    userId: number;
+    symbol: string;
+    side: "buy" | "sell";
+    price: number;
+    quantity: number;
+  }): { record: WalRecord; durable: Promise<void> } {
+    const record: WalRecord = {
+      seq: this.nextSeq++,
+      ts: Date.now(),
+      userId: o.userId,
+      symbol: o.symbol,
+      side: o.side,
+      price: o.price,
+      quantity: o.quantity,
+    };
+
+    // Step 1 — ordered write. Reaches the OS page cache, not the platter.
+    fs.writeSync(this.fd, JSON.stringify(record) + "\n");
+    this.appendCount++;
+
+    const durable = new Promise<void>((resolve) => this.waiters.push(resolve));
+
+    if (this.waiters.length >= this.maxBatch) {
+      this.flush(); // size threshold
+    } else if (!this.timer && !this.immediate) {
+      // time threshold — armed by the FIRST record of a batch
+      if (this.maxDelayMs === 0) {
+        this.immediate = setImmediate(() => this.flush());
+      } else {
+        this.timer = setTimeout(() => this.flush(), this.maxDelayMs);
+      }
+    }
+
+    return { record, durable };
+  }
+
+  /** fsync once, then release everyone waiting on that flush. */
+  private flush(): void {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.immediate) { clearImmediate(this.immediate); this.immediate = null; }
+    if (this.waiters.length === 0) return;
+
+    // Capture before the fsync. Nothing can be added during it: fsyncSync
+    // is blocking and this process is single-threaded.
+    const releasing = this.waiters;
+    this.waiters = [];
+
+    fs.fsyncSync(this.fd); // <- THE durability point for this whole batch
+    this.fsyncCount++;
+    this.batchSizes.push(releasing.length);
+
+    for (const resolve of releasing) resolve();
+  }
+
+  /** Flush anything outstanding (used on graceful shutdown / tests). */
+  flushNow(): void { this.flush(); }
+
+  close(): void {
+    this.flush();
+    try { fs.closeSync(this.fd); } catch { /* already closed */ }
+  }
+
+  get sequence(): number { return this.nextSeq; }
+
+  get averageBatchSize(): number {
+    if (this.batchSizes.length === 0) return 0;
+    return this.batchSizes.reduce((a, b) => a + b, 0) / this.batchSizes.length;
+  }
+}

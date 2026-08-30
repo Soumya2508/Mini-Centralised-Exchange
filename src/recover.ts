@@ -31,7 +31,8 @@ import { Wal, WalRecord, DEFAULT_WAL_PATH } from "./wal.js";
 
 export interface RecoveryResult {
   engine: MatchingEngine;
-  wal: Wal;
+  /** Sequence number the next appended record should carry. */
+  startSeq: number;
   genesisBalances: number;
   genesisOrders: number;
   recordsReplayed: number;
@@ -63,13 +64,15 @@ export async function recover(
   }
   const recoveryMs = performance.now() - t0;
 
-  // 3. Resume, continuing the sequence
+  // 3. Hand back the sequence to resume from. The caller opens the log
+  //    for appending, choosing fsync-per-order (Wal) or batched fsync
+  //    (GroupCommitWal) — recovery is identical either way, because the
+  //    on-disk format is the same.
   const startSeq = records.length > 0 ? records[records.length - 1].seq + 1 : 1;
-  const wal = new Wal(walPath, startSeq);
 
   return {
     engine,
-    wal,
+    startSeq,
     genesisBalances: balanceRows,
     genesisOrders: restingOrders,
     recordsReplayed: records.length,

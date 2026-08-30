@@ -1,49 +1,78 @@
-// ── Stage 3 Step 1 API — WAL-backed in-memory engine ──────────
+// ── Stage 3 Step 2 API — WAL with GROUP COMMIT ────────────────
 //
 // Order path per request:
 //   1. validate the request shape
-//   2. append the order to the WAL and fsync it to disk
-//   3. ONLY THEN apply it to the in-memory engine
+//   2. write() the record to the log        <- ordered, not yet durable
+//   3. apply it to the in-memory engine
+//   4. await the batch fsync                <- THE durability point
+//   5. ONLY THEN acknowledge the client
 //
-// Step 2 of the write is the durability point. If the process dies
-// after (2) and before (3), replay re-applies the order. If it dies
-// during (2), the record never lands and memory never saw it either.
-// Memory can never be ahead of the log.
+// Step 2 precedes step 3, so this is never apply-then-log. Step 4
+// precedes step 5, so nothing is ever acknowledged before it is on
+// disk. An order that was applied but not yet fsynced exists only in
+// RAM; if the process dies there, memory dies with it and recovery
+// replays a log that simply lacks the order — and the client was never
+// told it succeeded. There is no acknowledged-but-lost window.
 //
-// Step 1 fsyncs every order individually — the deliberately naive
-// baseline whose cost licenses group commit in Step 2.
+// WAL_MODE selects the durability strategy, so all three can be
+// measured back-to-back in ONE session (cross-session throughput
+// comparisons on this host are unreliable — see DEVLOG):
+//   group-commit    (default) batched fsync
+//   fsync-per-order           Step 1 behaviour
+//   none                      NO WAL AT ALL - Stage 2 behaviour.
+//                             MEASUREMENT ONLY. Not durable. Never a
+//                             deployment setting; it exists so the cost
+//                             of durability can be priced honestly.
+// WAL_BATCH_SIZE / WAL_BATCH_MS tune the batch triggers.
 
 import express from "express";
 import { MatchingEngine } from "./engine.js";
-import { Wal, DEFAULT_WAL_PATH } from "./wal.js";
+import { Wal, GroupCommitWal, DEFAULT_WAL_PATH } from "./wal.js";
 import { recover } from "./recover.js";
 import { pool } from "./db.js";
 
 const app = express();
 app.use(express.json());
 
+const WAL_MODE = process.env.WAL_MODE ?? "group-commit";
+// Tuned defaults (measured, see DEVLOG): batch 32, maxDelay 0.
+//
+// maxDelay 0 means "flush at the end of this event-loop turn"
+// (setImmediate) rather than arming a timer. That matters a lot: on
+// Windows the default timer resolution is ~15.6ms, so setTimeout(1) does
+// NOT fire in 1ms. At 1 VU the timer path measured 69 ord/s (p50 15.3ms)
+// against 603 ord/s (p50 1.4ms) for setImmediate — 8.8x. At 25+ VUs the
+// two are equal because the size threshold fires first either way.
+//
+// Batch size is bounded by in-flight requests, so a large maxBatch
+// without matching concurrency just defers to the delay trigger.
+const BATCH_SIZE = Number(process.env.WAL_BATCH_SIZE ?? 32);
+const BATCH_MS = Number(process.env.WAL_BATCH_MS ?? 0);
+
 let engine: MatchingEngine;
-let wal: Wal;
+let gcWal: GroupCommitWal | null = null;
+let perOrderWal: Wal | null = null;
 
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     engine: engine ? "in-memory" : "not ready",
-    durable: true,
-    mode: "wal-fsync-per-order",
-    walPath: DEFAULT_WAL_PATH,
+    durable: WAL_MODE !== "none",
+    mode: WAL_MODE,
+    batchSize: WAL_MODE === "group-commit" ? BATCH_SIZE : 1,
+    batchMs: WAL_MODE === "group-commit" ? BATCH_MS : 0,
     walBytes: Wal.sizeBytes(DEFAULT_WAL_PATH),
-    appends: wal ? wal.appendCount : 0,
-    fsyncs: wal ? wal.fsyncCount : 0,
+    appends: gcWal?.appendCount ?? perOrderWal?.appendCount ?? 0,
+    fsyncs: gcWal?.fsyncCount ?? perOrderWal?.fsyncCount ?? 0,
+    avgBatch: gcWal ? Number(gcWal.averageBatchSize.toFixed(2)) : 1,
   });
 });
 
-// ── Place an order: WAL append + fsync, THEN apply ────────────
-app.post("/order", (req, res) => {
+app.post("/order", async (req, res) => {
   const { userId, symbol, side, price, quantity } = req.body;
 
-  // Shape validation happens BEFORE the log: a malformed HTTP request
-  // is not an order and must never enter the WAL.
+  // Shape validation BEFORE the log: a malformed HTTP request is not an
+  // order and must never enter the WAL.
   if (!userId || !symbol || !side || !price || !quantity) {
     res.status(400).json({ success: false, error: "Missing required fields: userId, symbol, side, price, quantity" });
     return;
@@ -57,18 +86,46 @@ app.post("/order", (req, res) => {
     return;
   }
 
-  // ── WRITE-AHEAD: durable on disk before it exists in memory ──
-  wal.append({ userId, symbol, side, price, quantity });
+  const input = { userId, symbol, side, price, quantity } as const;
 
-  // ── Then apply. A business rejection here (no match, insufficient
-  // funds) is a legitimate outcome, not a durability failure: the
-  // order was genuinely submitted and replay will reject it too.
+  if (WAL_MODE === "none") {
+    // Measurement baseline: no logging, no durability (Stage 2).
+    try {
+      res.json({ success: true, trade: engine.processOrder(input) });
+    } catch (err: unknown) {
+      res.status(400).json({ success: false, error: err instanceof Error ? err.message : "Unknown error" });
+    }
+    return;
+  }
+
+  if (gcWal) {
+    // ── GROUP COMMIT ──
+    // write -> apply -> await batch fsync -> ack
+    const { durable } = gcWal.appendAndAwaitDurable(input);
+
+    let trade: unknown = null;
+    let error: string | null = null;
+    try {
+      trade = engine.processOrder(input);
+    } catch (err) {
+      error = err instanceof Error ? err.message : "Unknown error";
+    }
+
+    // Do not answer until this order's batch is on disk.
+    await durable;
+
+    if (error) res.status(400).json({ success: false, error });
+    else res.json({ success: true, trade });
+    return;
+  }
+
+  // ── Step 1 behaviour: one fsync per order ──
+  perOrderWal!.append(input);
   try {
-    const trade = engine.processOrder({ userId, symbol, side, price, quantity });
+    const trade = engine.processOrder(input);
     res.json({ success: true, trade });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    res.status(400).json({ success: false, error: message });
+    res.status(400).json({ success: false, error: err instanceof Error ? err.message : "Unknown error" });
   }
 });
 
@@ -94,8 +151,6 @@ app.get("/state", (_req, res) => {
     restingOrders: orders.filter((o) => o.status === "open" || o.status === "partial").length,
     tradeCount: engine.getTrades().length,
     lastTrade: engine.getTrades().slice(-1)[0] ?? null,
-    walBytes: Wal.sizeBytes(DEFAULT_WAL_PATH),
-    walSequence: wal.sequence,
   });
 });
 
@@ -105,17 +160,28 @@ const PORT = process.env.PORT ?? 3000;
 recover(DEFAULT_WAL_PATH)
   .then(async (r) => {
     engine = r.engine;
-    wal = r.wal;
-    // The genesis read is the only DB access; close the pool so it is
-    // unmistakable that the order path never touches Postgres.
+    if (WAL_MODE === "none") {
+      // no log opened
+    } else if (WAL_MODE === "group-commit") {
+      gcWal = new GroupCommitWal(DEFAULT_WAL_PATH, r.startSeq, {
+        maxBatch: BATCH_SIZE,
+        maxDelayMs: BATCH_MS,
+      });
+    } else {
+      perOrderWal = new Wal(DEFAULT_WAL_PATH, r.startSeq);
+    }
+    if (WAL_MODE === "none") {
+      console.warn("  *** WAL_MODE=none — NO DURABILITY. Measurement only. ***");
+    }
     await pool.end();
     app.listen(PORT, () => {
-      console.log(`Exchange API (Stage 3 Step 1, WAL + in-memory) on http://localhost:${PORT}`);
+      console.log(`Exchange API (Stage 3 Step 2, WAL + in-memory) on http://localhost:${PORT}`);
       console.log(`  genesis:  ${r.genesisBalances} balances, ${r.genesisOrders} resting orders (Postgres)`);
       console.log(`  RECOVERY: replayed ${r.recordsReplayed} WAL records in ${r.recoveryMs.toFixed(1)}ms ` +
                   `(${r.appliedOnReplay} applied, ${r.rejectedOnReplay} rejected)`);
-      console.log(`  WAL:      ${DEFAULT_WAL_PATH} (${Wal.sizeBytes(DEFAULT_WAL_PATH)} bytes), resuming at seq ${wal.sequence}`);
-      console.log(`  DURABLE:  append + fsync BEFORE apply, one fsync per order`);
+      console.log(`  WAL mode: ${WAL_MODE}` +
+                  (WAL_MODE === "group-commit" ? ` (batch=${BATCH_SIZE}, maxDelay=${BATCH_MS}ms)` : ""));
+      console.log(`  DURABLE:  write -> apply -> fsync -> ack; nothing acked before its fsync`);
     });
   })
   .catch((err) => {
