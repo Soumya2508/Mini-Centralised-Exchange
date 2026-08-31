@@ -8,3 +8,5 @@ dist/
 .env
 !loadtest/**
 data/
+_cm*.txt
+_tsc_*.txt
