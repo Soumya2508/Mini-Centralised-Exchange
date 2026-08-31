@@ -6,7 +6,8 @@
     "dev": "npx tsx src/server.ts",
     "test": "tsx src/test/invariants.ts",
     "seed:load": "docker exec -i exchange_postgres psql -U exchange -d db_exchange -f /dev/stdin < db/seed-load.sql",
-    "projector": "tsx src/projection/worker.ts"
+    "projector": "tsx src/projection/worker.ts",
+    "readapi": "tsx src/readapi/server.ts"
   },
   "keywords": [],
   "author": "",
