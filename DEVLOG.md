@@ -1038,3 +1038,138 @@ Cursor equals the WAL size exactly. Trade ids form a **contiguous 1..100,008 wit
 No Redis or queue. No normalised schema, no indexes, no query endpoints — the schema is deliberately flat and there is no read API yet. Those are Step 4.2.
 
 **Next:** Step 4.2 — normalised read-model schema + query endpoints. Human-driven, not autonomous.
+
+---
+
+## [2026-08-31] — Stage 4 Step 4.2: normalised read-model + query endpoints + batched projection
+
+**Change:** the flat 4.1 read-model became a proper normalised CQRS read side, the per-row projection was replaced with batched writes, and a **separate read API process** now serves queries from `readmodel.*` only.
+
+```
+writes: order -> WAL (fsync) -> engine (RAM)              :3000
+reads:  readmodel.* <- worker <- WAL (tail, read-only)    :3001
+```
+
+### Normalised schema (`readmodel.*`)
+
+Six tables: `users`, `orders`, `trades`, `balances`, `cursor`, `meta`. Real foreign keys throughout — `orders.user_id -> users.id`, `trades.buyer_order_id/seller_order_id -> orders.id`, `balances.user_id -> users.id` — plus CHECK constraints on `side` and `status`, and a `wal_seq` provenance column on orders and trades so any row is traceable back to the log record that produced it.
+
+```
+                         Table "readmodel.orders"
+ id | user_id | symbol | side | price | quantity | filled | status | wal_seq | created_at
+Indexes:
+    "orders_pkey" PRIMARY KEY, btree (id)
+    "idx_orders_book"      btree (symbol, side, price) WHERE status IN ('open','partial')
+    "idx_orders_user"      btree (user_id, id DESC)
+    "idx_orders_user_open" btree (user_id, id DESC)    WHERE status IN ('open','partial')
+Check constraints: orders_side_check, orders_status_check
+Foreign-key constraints: orders_user_id_fkey -> readmodel.users(id)
+Referenced by: trades_buyer_order_id_fkey, trades_seller_order_id_fkey
+
+                         Table "readmodel.trades"
+ id | symbol | price | quantity | buyer_order_id | seller_order_id
+    | buyer_user_id | seller_user_id | wal_seq | executed_at
+Indexes:
+    "trades_pkey" PRIMARY KEY, btree (id)
+    "idx_trades_buyer"  btree (buyer_user_id, executed_at DESC)
+    "idx_trades_seller" btree (seller_user_id, executed_at DESC)
+    "idx_trades_market" btree (symbol, executed_at DESC)
+Foreign-key constraints: 4 (both order ids, both user ids)
+```
+
+Indexes were chosen from the queries actually served, not sprinkled: two on trades because a user can be on either side of one; partial indexes on orders because only resting orders are ever queried that way and they are a shrinking minority of a growing table.
+
+**The one deliberate denormalisation:** `trades.buyer_user_id` / `trades.seller_user_id` duplicate what could be reached by joining `orders` twice. "Show me my trade history" is the most common read, and without these every such query needs two joins just to discover whose trade it was. It is safe *because this is a derived view*: both copies are written from the same projection of the same log record, so they cannot drift. In the write model that duplication would be a bug; here it is a cache. Flagged as such in `schema.ts`.
+
+Because the read-model is derived and disposable, a schema change needs no migration — `SCHEMA_VERSION` is bumped, the worker drops the schema and re-projects from the log. That is one of the real payoffs of CQRS.
+
+### Projection throughput: 545 -> 2,923 records/sec (5.4x)
+
+Step 4.1 measured 545 rec/s against an engine doing ~2100 ord/s, so the read-model fell behind **indefinitely**. Cause: a per-row loop issuing up to seven individual `INSERT ... ON CONFLICT` round-trips per record inside the transaction.
+
+Two changes:
+1. **Dedupe within the batch.** A resting order hit by 40 takers in one batch produced 40 UPDATEs of the same row; now it produces one carrying the final state. Valid only because the read-model stores current state, not a history of mutations. This is also required for *correctness*: Postgres rejects an `ON CONFLICT DO UPDATE` that touches the same row twice in one statement.
+2. **One statement per table via `UNNEST(array, array, ...)`**, so parameter count is fixed at the number of columns instead of growing with rows.
+
+Measured by building a backlog with the worker down, then timing the catch-up (excluding `tsx` startup):
+
+```
+  records projected in timed window: 39055
+  elapsed: 13.36s
+  PROJECTION THROUGHPUT: 2923 records/sec
+  Step 4.1 baseline was 545 rec/s -> 5.4x faster
+  engine peak is ~2100 ord/s -> projection is 1.4x the engine rate
+```
+
+The ratio is what matters: 4.1 ran at 0.26x the ingest rate and could never converge; 4.2 runs at 1.4x and does.
+
+### Query endpoints — a separate process, `readmodel.*` only
+
+`src/readapi/server.ts` (`npm run readapi`, port 3001): `/history?userId=`, `/openorders?userId=`, `/balances[?userId=]`, `/orderbook?symbol=`, `/market?symbol=`, `/stats`.
+
+Isolation is structural, and was verified mechanically rather than asserted:
+
+```
+=== read API imports (must be pool ONLY) ===
+31:import express from "express";
+32:import { pool } from "../db.js";
+=== does the read API touch engine/wal/log? ===
+  NONE — Postgres only
+=== every query targets readmodel.*? ===
+  17 references to readmodel.*;  no query hits public.* tables
+```
+
+`/stats` deliberately exposes the projection lag rather than pretending the read side is synchronous.
+
+### Proof (a) — queries match the source of truth
+
+After trading, `/history?userId=7` compared against the engine's own trades:
+
+```
+  ENGINE (source of truth via WAL): 6 trades for user 7
+    (9,'buy',100.0,7.0) (5,'buy',95.0,1.0) (4,'buy',95.0,2.0)
+    (3,'buy',90.0,1.0)  (2,'buy',90.0,2.0) (1,'buy',90.0,2.0)
+  READ-MODEL /history?userId=7    : 6 trades
+    (9,'buy',100.0,7.0) (5,'buy',95.0,1.0) (4,'buy',95.0,2.0)
+    (3,'buy',90.0,1.0)  (2,'buy',90.0,2.0) (1,'buy',90.0,2.0)
+  MATCH: IDENTICAL
+```
+
+`/openorders?userId=7` returned 12, matching the engine's 12 resting orders for that user. `/balances?userId=7` joined through to the username. `/orderbook` aggregated 2000 resting sells into price levels.
+
+### Proof (b) — read/write isolation, with an honest caveat
+
+Fresh liquidity re-seeded, `match_rate 100.00%` on both runs so these are real throughput numbers:
+
+| run | engine throughput | match | engine p95 | read side |
+|-----|------------------|-------|-----------|-----------|
+| writes only | **2023 ord/s** | 100.00% | 19.73ms | — |
+| writes + 25 VUs of queries | **1446 ord/s** | 100.00% | 26.04ms | 701 q/s, 100% ok, p95 51.85ms |
+
+**Engine throughput fell 29% when the read API was hammered — and that needs stating plainly rather than being dressed up as "no impact".**
+
+The decoupling is architectural and real: the engine holds **zero** database connections while serving (it calls `pool.end()` after bootstrap and runs entirely from RAM), so reads cannot contend with writes on locks, connections or transactions. `pg_stat_activity` during load showed connections only from the worker and the read API.
+
+What reads *can* still contend for on a single box is CPU. Two k6 containers, Postgres, the worker, the engine and the read API all share one machine. That is a deployment property, not a design flaw — and the decoupling is precisely what makes the fix trivial: move the read replica to separate hardware and the contention disappears, with no change to the engine. Claiming zero impact here would be false; the correct claim is *zero coupling, non-zero co-tenancy*.
+
+### Proof (c) — lag is now bounded and converges
+
+Under sustained write load the lag still grows (projection competes for CPU with everything else), but it converges quickly once the burst ends:
+
+```
+  after write+read burst:  caught up in 389ms
+  after 25s write burst:   ~21,640 records behind, converged 5522ms after load stopped
+```
+
+That backlog would have taken 21,640 / 545 = **~40 seconds** to drain at the 4.1 rate. It drained in **5.5s** — roughly **7x faster**, and, critically, it *converges at all*: at 0.26x ingest rate 4.1 could not.
+
+### Proof (d) — nothing else moved
+
+`npm test` green (`ALL INVARIANTS HOLD`, exit 0). `git diff --stat` over `engine.ts`, `server.ts`, `orderProcessor.ts`, `bootstrap.ts`, `recover.ts`, `wal.ts`, `db.ts` and the harness reports **no changes at all**. This step touched only `src/projection/`, the new `src/readapi/`, a new load script, and `package.json` scripts.
+
+### Operational notes worth recording
+
+- **Re-seeding requires restarting the engine.** One measurement run came back `match_rate 0.00%` because `seed:load` added genesis rows to `public.orders` while the engine had already bootstrapped from the previous seed — a running engine cannot see new genesis. That run was discarded, not reported.
+- **`npm run projector` leaves child processes.** Killing the npm wrapper by PID leaves the `tsx`/node child projecting, which silently invalidated one throughput measurement (the "backlog" had already been consumed). Kill by matching `worker.ts`, and verify zero remain — a PowerShell `-like '*projection*'` filter also matches its own query process, which is misleading.
+
+**Next:** Bug 5 (single-level match) is still the outstanding scope decision, and `tsc --noEmit` still reports the pre-existing strict-index errors in `engine.ts`. Both are worth closing before the project is called finished.

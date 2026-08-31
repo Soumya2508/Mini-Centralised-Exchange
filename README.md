@@ -15,9 +15,9 @@ An order-matching exchange built in TypeScript, developed in **measured stages**
 | **Stage 1** ✅ | Measure the baseline under load | The measurement licenses the next stage — if no wall appears, stop |
 | **Stage 2** ✅ | In-memory matching (single-threaded) | Justified only if Stage 1 shows matching is the bottleneck. Consequence: durability is lost |
 | **Stage 3** ✅ | Custom WAL with group commit + crash recovery | Rebuild durability without reintroducing the Stage-1 wall. The centerpiece |
-| **Stage 4** ◐ | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
+| **Stage 4** ✅ | Async projection to Postgres read-model | Log stays source of truth; Postgres becomes a derived, queryable view (CQRS) |
 
-### Current status: **Stage 4 Step 4.1 — WAL projected into a derived Postgres read-model**
+### Current status: **Stage 4 complete — CQRS read side over the WAL**
 
 Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wall at **~181 orders/sec**, dominated by **row-lock contention** (54.2% of backend samples) rather than fsync (0.15%). Stage 2 moved matching into a **single-threaded in-memory engine** — fast, but durability deliberately deleted. Stage 3 rebuilt durability by another route: a **write-ahead log** with group commit and CRC32 torn-write protection, reaching **~3254 orders/sec** — **18x the ACID baseline, while still crash-durable**.
 
@@ -31,9 +31,9 @@ Stage 0 built a correct transactional Postgres baseline. Stage 1 profiled its wa
 
 Because cross-session throughput on this host drifts, every comparison that carries weight was measured **same-session and interleaved**. At 25 VUs: no durability at all 3380 ord/s, fsync-per-order 1016, group commit 3292 — **group commit recovers 96.3% of what durability cost, for +0.45ms p95**. Adding CRC32 framing then costs a further **1.2%** (0.0% pooled across levels — below the harness's noise floor).
 
-Stage 4 Step 4.1 adds a **projection worker**: a separate process that tails the WAL and derives a Postgres read-model from it. Step 4.2 (normalised schema + query endpoints) is not started.
+Stage 4 completes the picture: a **projection worker** tails the WAL and derives a **normalised Postgres read-model**, and a **separate read API process** serves queries from it. The engine never participates in a read.
 
-### Stage 4.1 — Postgres as a derived view
+### Stage 4 — Postgres as a derived, queryable view (CQRS)
 
 ```
 order -> WAL (fsync) -> engine (RAM)
@@ -46,7 +46,11 @@ No Redis, no queue — the worker reads the log file directly, so the read-model
 - **Decoupled by construction** — nothing imports the worker; the hot path was not modified at all in this step. Killing the worker mid-load left the engine at **64,400 orders, 100% match rate, 0% failures, 2146 ord/s**; the read-model simply went stale and caught up on restart.
 - **Exactly-once without idempotency gymnastics** — the cursor is updated in the *same transaction* as the rows it accounts for, so "wrote the data but lost the offset" cannot happen. After a hard kill mid-projection and restart, trade ids came back **contiguous 1..100,008 with n = span**, zero duplicates, matching the engine exactly.
 - **Its own schema** — the engine reads `public.*` as genesis, so projecting there would corrupt replay. Derived rows go to `readmodel.*`, which is disposable and rebuildable from the log.
-- **Known limitation** — projection runs at ~545 records/sec against the engine's ~2100 ord/s, so under sustained peak load the read-model lags. Correctness is unaffected (the cursor guarantees eventual exactness); batching the per-row inserts is Step 4.2 work.
+- **Batched projection** — dedupe-within-batch plus one `UNNEST` statement per table took projection from **545 to 2,923 records/sec (5.4x)**. At 1.4x the engine's peak ingest rate the read-model now converges instead of falling behind forever; a 21,640-record backlog drains in 5.5s where 4.1 would have needed ~40s.
+- **Normalised schema with real constraints** — `readmodel.users / orders / trades / balances`, foreign keys throughout, CHECK constraints, `wal_seq` provenance on every row, and indexes chosen from the queries actually served (including partial indexes for resting orders). One deliberate denormalisation: `trades.buyer_user_id` / `seller_user_id`, so trade history serves from an index with no join — safe precisely because a derived view cannot drift from itself.
+- **Separate read API** (`npm run readapi`, :3001) — `/history`, `/openorders`, `/balances`, `/orderbook`, `/market`, `/stats`. It imports only the Postgres pool: no engine, no WAL, no log file.
+
+**Measured honestly:** the engine holds *zero* database connections while serving, so reads cannot contend on locks or transactions. But with everything co-resident on one machine, hammering the read API with 25 VUs of queries still cost the engine **2023 → 1446 ord/s (-29%)** through CPU contention. Zero coupling, non-zero co-tenancy — the fix is separate hardware for the read replica, which is exactly what the decoupling makes possible.
 
 ### The WAL, in one place
 
@@ -412,7 +416,7 @@ A matching engine for one instrument is fundamentally **single-writer** — all 
 - [x] **Stage 1** — Profiled the wall: index separated, dominant cost = row-lock contention
 - [x] **Stage 2** — In-memory matching (single-threaded, lock-free) — 11.8x, durability dropped by design
 - [x] **Stage 3** — Custom WAL: append-before-execute, group commit, CRC32 torn-write protection, crash recovery (~3254 ord/s)
-- [◐] **Stage 4** — Async projection: Step 4.1 done (worker tails the WAL into a derived read-model, decoupled). Step 4.2 (normalised schema + query endpoints) pending.
+- [x] **Stage 4** — Async projection: worker tails the WAL into a normalised Postgres read-model with a separate query API (CQRS)
 
 ## License
 
