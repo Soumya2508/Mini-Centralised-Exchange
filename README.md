@@ -8,7 +8,8 @@ The result is **~3,254 orders/sec while remaining crash-durable**, against **~18
 
 ## Architecture
 
-![Architecture diagram](docs/architecture.png)
+<img width="1344" height="896" alt="image" src="https://github.com/user-attachments/assets/eb9b50ad-4a4c-4aa0-8d6f-49f9f35922c3" />
+
 
 ## Key results
 
