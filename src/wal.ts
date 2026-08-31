@@ -136,12 +136,29 @@ export interface ReplayResult {
   stoppedBecause: null | "short-length" | "short-payload" | "bad-length" | "crc-mismatch" | "bad-json";
   /** True when the damage was NOT at the end of the file — real corruption. */
   midFileCorruption: boolean;
+  /** Byte position just past the last COMPLETE record. A tailing reader
+   *  resumes from here; anything after it is a partial record. */
+  nextOffset: number;
   format: WalFormat;
 }
 
-function replayFramed(buf: Buffer): ReplayResult {
+/**
+ * Scan complete frames out of `buf` starting at `startOff`.
+ *
+ * Read-only and shared by two callers with different needs:
+ *   - crash recovery, which scans the whole file once at startup;
+ *   - the projection worker (Stage 4), which tails the log and calls
+ *     this repeatedly from its last durable offset.
+ *
+ * Both must treat a partial trailing record identically: stop at the
+ * last COMPLETE record and report where that ended. For recovery the
+ * remainder is a torn write to discard; for the tailing worker it is
+ * simply a record still being written, to be picked up next poll.
+ * `nextOffset` is the byte position after the last complete record.
+ */
+export function scanFrames(buf: Buffer, startOff = 0): ReplayResult {
   const records: WalRecord[] = [];
-  let off = 0;
+  let off = startOff;
   let stoppedBecause: ReplayResult["stoppedBecause"] = null;
 
   while (off < buf.length) {
@@ -177,7 +194,7 @@ function replayFramed(buf: Buffer): ReplayResult {
     stoppedBecause === "crc-mismatch" || stoppedBecause === "bad-length" ||
     stoppedBecause === "bad-json";
 
-  return { records, discardedBytes, stoppedBecause, midFileCorruption, format: "framed" };
+  return { records, discardedBytes, stoppedBecause, midFileCorruption, nextOffset: off, format: "framed" };
 }
 
 function replayJsonl(raw: string): ReplayResult {
@@ -196,15 +213,33 @@ function replayJsonl(raw: string): ReplayResult {
       );
     }
   }
-  return { records, discardedBytes: 0, stoppedBecause: null, midFileCorruption: false, format: "jsonl" };
+  return { records, discardedBytes: 0, stoppedBecause: null, midFileCorruption: false,
+           nextOffset: raw.length, format: "jsonl" };
 }
 
 // ── Shared read path ──────────────────────────────────────────
 
+/**
+ * Read complete records from `filePath` starting at `startOffset`.
+ * Used by the Stage 4 projection worker to tail the log: it reuses the
+ * exact framing and torn-record rules as crash recovery, so the worker
+ * can never see a record the engine would not have recovered.
+ */
+export function readFramedFrom(filePath: string, startOffset: number): ReplayResult {
+  const empty: ReplayResult = {
+    records: [], discardedBytes: 0, stoppedBecause: null,
+    midFileCorruption: false, nextOffset: startOffset, format: "framed",
+  };
+  if (!fs.existsSync(filePath)) return empty;
+  const buf = fs.readFileSync(filePath);
+  if (buf.length <= startOffset) return empty;
+  return scanFrames(buf, startOffset);
+}
+
 export function replayDetailed(filePath: string = DEFAULT_WAL_PATH): ReplayResult {
   const empty: ReplayResult = {
     records: [], discardedBytes: 0, stoppedBecause: null,
-    midFileCorruption: false, format: "framed",
+    midFileCorruption: false, nextOffset: 0, format: "framed",
   };
   if (!fs.existsSync(filePath)) return empty;
   const buf = fs.readFileSync(filePath);
@@ -213,7 +248,7 @@ export function replayDetailed(filePath: string = DEFAULT_WAL_PATH): ReplayResul
   // Auto-detect: a legacy jsonl log starts with '{'. A framed log starts
   // with a big-endian length, whose first byte is 0 for any sane record.
   if (buf[0] === 0x7b /* '{' */) return replayJsonl(buf.toString("utf8"));
-  return replayFramed(buf);
+  return scanFrames(buf, 0);
 }
 
 // ── Step 1: one fsync per order ───────────────────────────────

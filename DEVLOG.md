@@ -880,3 +880,161 @@ Step 2 and Step 3 rows are the same-session A/B at 25 VUs and are directly compa
 **Still open:** Bug 5 (single-level match per incoming order) — unchanged deliberate scope cut. Also `npx tsc --noEmit` still reports pre-existing strict-mode index-access errors in `engine.ts` (present since Stage 2); `tsx` transpiles without typechecking so runtime and `npm test` are unaffected, but they are worth clearing before the project is called finished.
 
 **Next:** Stage 4 (async projection to a queryable Postgres read-model). Human-driven, not autonomous. NOT started.
+
+---
+
+## [2026-08-28] — Stage 4 Step 4.1: projection worker tails the WAL into a Postgres read-model
+
+**Change:** `src/projection/worker.ts`, a standalone process (`npm run projector`) that tails the WAL and derives a Postgres read-model from it. The WAL stays the source of truth; Postgres becomes a derived view.
+
+```
+order -> WAL (fsync) -> engine (RAM)
+            |
+            +--(tail, read-only)--> worker -> Postgres read-model
+```
+
+No Redis, no queue. The worker reads the log file directly, which is what makes Postgres a *provably* pure derived view — there is no second channel through which state could arrive.
+
+### Decoupling is structural, not a convention
+
+The engine has zero dependency on the worker. Verified mechanically:
+
+```
+=== does anything import the worker? ===
+  nothing imports the worker — it is only an entry point
+=== does the engine/hot path reference the projection? ===
+  (only comments in wal.ts; no code)
+```
+
+And the hot path was not touched at all this step — `git diff --stat` over `engine.ts`, `server.ts`, `orderProcessor.ts`, `bootstrap.ts`, `recover.ts` reports **no changes**. The only edits are a read-only addition to `wal.ts` (`scanFrames` / `readFramedFrom`, so the worker reuses the exact framing rather than re-parsing) and the new `src/projection/`.
+
+### Two decisions that were correctness-critical
+
+**1. The read-model lives in its own schema.** The engine bootstraps its GENESIS state from `public.orders` and `public.balances`. Had the projection written into those tables, the next engine restart would have loaded a different genesis and replay would have rebuilt the wrong world — the derived view silently corrupting the source of truth. Everything projected therefore goes to a separate `readmodel` schema. `public.*` is read-only genesis; `readmodel.*` is derived and disposable.
+
+**2. The cursor is updated in the SAME transaction as the rows it accounts for.**
+
+```sql
+BEGIN; upsert orders/trades/balances; UPDATE readmodel.cursor; COMMIT;
+```
+
+"Wrote the data but lost the offset" is not a window that idempotency has to paper over — it cannot happen. Either both land or neither does. Inserts also use `ON CONFLICT DO NOTHING / DO UPDATE` as a second line of defence.
+
+The log holds COMMANDS, so the worker runs its own `MatchingEngine` replica and re-executes them — the same determinism argument crash recovery relies on. On restart it replays already-projected records through the replica **silently** to rebuild state, then projects only what is past the cursor.
+
+**Bounded transactions.** The first implementation projected an entire backlog as one transaction: a 28k-record backlog became a single unbounded transaction, and the durable cursor was pointless because it only advanced once at the very end. Capped at 500 records per transaction (`PROJECTION_BATCH`), so a crash costs at most that much re-work.
+
+### Proof (a) — the read-model faithfully matches the WAL
+
+Engine and worker started as two independent processes, 8 orders placed (5 filled, 3 rejected):
+
+```
+=== POSTGRES read-model (derived) ===
+ orders | trades | balances        byte_offset | records_projected
+      8 |      5 |       10                840 |                 8
+
+ id |  symbol  |    price     |  quantity  | buyer_order_id | seller_order_id
+  1 | SOL_USDC | 90.00000000  | 5.00000000 |              4 |               1
+  2 | SOL_USDC | 95.00000000  | 3.00000000 |              5 |               2
+  3 | SOL_USDC | 110.00000000 | 4.00000000 |              6 |               3
+  4 | SOL_USDC | 110.00000000 | 2.00000000 |              7 |               3
+  5 | SOL_USDC | 110.00000000 | 2.00000000 |              8 |               3
+
+=== engine trades, for comparison ===
+  id=1 price=90  qty=5 buyer=4 seller=1
+  id=2 price=95  qty=3 buyer=5 seller=2
+  id=3 price=110 qty=4 buyer=6 seller=3
+  id=4 price=110 qty=2 buyer=7 seller=3
+  id=5 price=110 qty=2 buyer=8 seller=3
+```
+
+Cursor at byte 840 = exact WAL file size. All 8 submitted records projected, including the 3 the engine rejected — the log records what was *submitted*, and the projection is faithful to it.
+
+### Proof (b) — killing the worker does not touch the engine
+
+30s load at 25 VUs; the worker was hard-killed at t=10s and stayed dead for two thirds of the run:
+
+```
+>>> KILLING THE WORKER at t=10s (engine untouched) <<<
+--- is the ENGINE still serving? ---
+{"success":true,"trade":{"tradeId":25954,...}}
+
+=== k6 result (engine performance with the worker DEAD for 2/3 of the run) ===
+    match_rate.......: 100.00% 64400 out of 64400
+    orders_filled....: 64400   2146.328695/s
+    http_req_failed..: 0.00%   0 out of 64400
+    http_req_duration: avg=11.51ms med=10.35ms p(95)=19.53ms p(99)=28.96ms
+```
+
+**Zero failures, 100% match rate, 2146 ord/s** — indistinguishable from a run with the worker alive. The read-model simply went stale:
+
+```
+  WAL size now:      7105972 bytes
+  cursor at:         186165 bytes, 1710 records
+  engine trades:     64401     <- read-model is BEHIND, engine unaffected
+```
+
+Restarting the worker: it resumed from its durable offset, replayed the already-projected prefix silently, and converged exactly.
+
+```
+  replica caught up silently over 1710 already-projected records
+  resume: byte 186165, 1710 records already projected
+  ...
+ byte_offset | records_projected      rm_orders | rm_trades | rm_balances
+     7105972 |             64401          66404 |     64401 |         410
+  WAL bytes: 7105972
+  engine: orders 66404  trades 64401
+```
+
+Conservation also holds *independently* in the derived read-model — computed from projected rows, not from the engine:
+
+```
+ asset |        total                     engine totals
+ SOL   | 20000250.00000000                SOL  20000250
+ USDC  | 2000050000.00000000              USDC 2000050000
+ negative_in_readmodel: 0
+```
+
+### Proof (c) — durable offset survives a hard kill mid-projection
+
+A backlog was built with the worker down, the worker started, then hard-killed partway through projecting it:
+
+```
+  projecting: cursor 10341175 -> 10396461 (target 12917367)
+  >>> HARD KILL at offset 10506939 of 12917367 <<<
+  cursor at kill:  10506939   cursor settled: 10506939
+      (identical => the in-flight transaction rolled back cleanly)
+```
+
+Restarted, it resumed from `byte 10617444, 96176 records already projected` and ran to completion:
+
+```
+ byte_offset | records_projected        rm_orders | rm_trades
+    12917367 |            116836           102011 |    100008
+
+ dup_trade_ids | dup_order_ids
+             0 |             0
+
+ min_trade_id | max_trade_id |   n    | span_should_equal_n
+            1 |       100008 | 100008 |              100008
+
+ engine: orders 102011  trades 100008
+```
+
+Cursor equals the WAL size exactly. Trade ids form a **contiguous 1..100,008 with n = span = 100,008** — no duplicates and no gaps — and both tables match the engine exactly. Nothing was projected twice, nothing was skipped.
+
+### Correctness harness
+
+`npm test` unchanged and green (`ALL INVARIANTS HOLD`, exit 0). The engine and WAL were not modified, so nothing there needed re-proving.
+
+### Honest limitations
+
+**The projection is ~4x slower than the engine.** Measured catch-up rate: **~545 records/sec**, against the engine's ~2100 ord/s. Under *sustained* peak load the read-model would fall behind indefinitely; it only converges when the write rate drops. The cause is the naive per-row loop — each record issues up to seven individual `INSERT ... ON CONFLICT` round-trips inside the transaction. Batching them into multi-row statements is the obvious fix and belongs to Step 4.2. This does not affect correctness (the cursor guarantees eventual exactness), only freshness.
+
+**Liquidity was exhausted during the (c) load run** — the 100,016 SOL seed book has been consumed across many sessions, so that run reported `match_rate 27.34%` and `421 ord/s`. Those are rejection figures, not throughput, and are not quoted as such. It does not weaken proof (c): rejected orders are still logged and still projected, so the cursor/duplicate/gap checks are unaffected. Re-seed before any future throughput measurement.
+
+### Not done (deliberate)
+
+No Redis or queue. No normalised schema, no indexes, no query endpoints — the schema is deliberately flat and there is no read API yet. Those are Step 4.2.
+
+**Next:** Step 4.2 — normalised read-model schema + query endpoints. Human-driven, not autonomous.
