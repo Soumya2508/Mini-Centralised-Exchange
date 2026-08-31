@@ -533,7 +533,8 @@ async function testTornWriteProtection(): Promise<void> {
   p = tmp("d");
   await buildLog(p, 10);
   const buf = fs.readFileSync(p);
-  buf[buf.length - 12] ^= 0x01;               // flip a bit INSIDE the last payload
+  const flipAt = buf.length - 12;             // provably in range: 10 records were written
+  buf[flipAt] = buf[flipAt]! ^ 0x01;          // flip a bit INSIDE the last payload
   fs.writeFileSync(p, buf);                   // same length, damaged content
   res = replayDetailed(p);
   assert("damaged record rejected by CRC", res.records.length === 9, `read=${res.records.length}`);
