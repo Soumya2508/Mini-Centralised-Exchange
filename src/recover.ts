@@ -77,7 +77,7 @@ export async function recover(
   //    for appending, choosing fsync-per-order (Wal) or batched fsync
   //    (GroupCommitWal) — recovery is identical either way, because the
   //    on-disk format is the same.
-  const startSeq = records.length > 0 ? records[records.length - 1].seq + 1 : 1;
+  const startSeq = records.length > 0 ? records[records.length - 1]!.seq + 1 : 1; // guarded by length > 0
 
   return {
     engine,

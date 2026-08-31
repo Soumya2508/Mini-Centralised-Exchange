@@ -39,8 +39,9 @@ export interface TradeResult {
 export async function processOrder(input: OrderInput): Promise<TradeResult> {
   const client = await pool.connect();
 
-  const baseAsset = input.symbol.split("_")[0];  // "SOL"
-  const quoteAsset = input.symbol.split("_")[1]; // "USDC"
+  // Symbols are BASE_QUOTE. Type-level assertion only: a malformed symbol
+  // still behaves exactly as before, failing the balance lookup below.
+  const [baseAsset, quoteAsset] = input.symbol.split("_") as [string, string]; // "SOL", "USDC"
 
   try {
     await client.query("BEGIN");

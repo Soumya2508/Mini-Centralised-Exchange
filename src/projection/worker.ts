@@ -357,7 +357,9 @@ async function main(): Promise<void> {
 
     const pending = emptyPending();
     for (const r of batch) applyInto(engine, index, r, pending);
-    const projected = cursor.recordsProjected + batch.length;
+    // Explicit annotation breaks a circular inference: `cursor` is later
+    // reassigned from an object containing this value.
+    const projected: number = cursor.recordsProjected + batch.length;
     await writeBatch(pending, batchEnd, projected);
     cursor = { byteOffset: batchEnd, recordsProjected: projected };
 

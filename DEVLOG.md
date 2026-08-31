@@ -1173,3 +1173,13 @@ That backlog would have taken 21,640 / 545 = **~40 seconds** to drain at the 4.1
 - **`npm run projector` leaves child processes.** Killing the npm wrapper by PID leaves the `tsx`/node child projecting, which silently invalidated one throughput measurement (the "backlog" had already been consumed). Kill by matching `worker.ts`, and verify zero remain — a PowerShell `-like '*projection*'` filter also matches its own query process, which is misleading.
 
 **Next:** Bug 5 (single-level match) is still the outstanding scope decision, and `tsc --noEmit` still reports the pre-existing strict-index errors in `engine.ts`. Both are worth closing before the project is called finished.
+
+---
+
+## [2026-08-31] — Cleanup: clear tsc strict-index errors
+
+`npx tsc --noEmit` reported **16** errors across 5 files (not 4 in `engine.ts` as an earlier entry claimed — that figure came from a truncated `head -5` of the output and was wrong). All were consequences of `noUncheckedIndexedAccess: true`: array/`split()` indexing yields `T | undefined`.
+
+Fixed properly — no `@ts-ignore`, no loosening of `tsconfig`. Non-null assertions only where the index is provably in range (loop bounds, `length > 0` guards), `as [string, string]` for `BASE_QUOTE` symbol destructuring (type-level only: a malformed symbol still falls through to the same "no balance found" rejection as before), one explicit `: number` annotation to break a circular inference, and one genuine expression change — `key.split(":")[1]` became `key.slice(key.indexOf(":") + 1)`, which is provably a `string` and needs no assertion at all. Verified equivalent: balance keys are `${userId}:${asset}` and assets contain no colon.
+
+`engine.ts` 11 → 0, `orderProcessor.ts` 2 → 0, `projection/worker.ts` 1 → 0, `recover.ts` 1 → 0, `test/invariants.ts` 1 → 0. **`npx tsc --noEmit` now emits nothing at all.** `npm test` green, including the dual-engine parity section that proves the DB and in-memory matching engines still produce identical outcomes and balances across all five scenarios. Type-safety only; no logic changed.

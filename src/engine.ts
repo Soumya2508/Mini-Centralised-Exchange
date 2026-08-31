@@ -113,7 +113,8 @@ class BookSide {
       this.levels.set(order.price, level);
       // insert price into the sorted array
       let i = 0;
-      while (i < this.prices.length && this.prices[i] < order.price) i++;
+      // Bounded by `i < this.prices.length`, so the index is always in range.
+      while (i < this.prices.length && this.prices[i]! < order.price) i++;
       this.prices.splice(i, 0, order.price);
     }
     level.push(order); // FIFO => time priority
@@ -124,7 +125,8 @@ class BookSide {
     for (const p of this.prices) {
       if (p > limit) break; // ascending: nothing cheaper remains
       const level = this.levels.get(p);
-      if (level && level.length > 0) return level[0];
+      // Guarded by length > 0, so element 0 exists.
+      if (level && level.length > 0) return level[0]!;
     }
     return null;
   }
@@ -132,10 +134,11 @@ class BookSide {
   /** Most expensive resting order at or above `limit` (for an incoming sell). */
   bestAtOrAbove(limit: number): Order | null {
     for (let i = this.prices.length - 1; i >= 0; i--) {
-      const p = this.prices[i];
+      const p = this.prices[i]!; // loop is bounded by the array length
       if (p < limit) break; // descending: nothing dearer remains
       const level = this.levels.get(p);
-      if (level && level.length > 0) return level[0];
+      // Guarded by length > 0, so element 0 exists.
+      if (level && level.length > 0) return level[0]!;
     }
     return null;
   }
@@ -211,7 +214,9 @@ export class MatchingEngine {
   totals(): Map<string, number> {
     const t = new Map<string, number>();
     for (const [key, amt] of this.balances) {
-      const asset = key.split(":")[1];
+      // Keys are built internally as `${userId}:${asset}`, so everything
+      // after the first ':' is the asset. slice() always yields a string.
+      const asset = key.slice(key.indexOf(":") + 1);
       t.set(asset, round8((t.get(asset) ?? 0) + amt));
     }
     return t;
@@ -245,7 +250,10 @@ export class MatchingEngine {
   // exists — is silently lost.
 
   processOrder(input: OrderInput): TradeResult {
-    const [baseAsset, quoteAsset] = input.symbol.split("_");
+    // Symbols are BASE_QUOTE. This is a type-level assertion only: a
+    // malformed symbol still behaves exactly as before, failing the
+    // balance lookup below rather than being caught here.
+    const [baseAsset, quoteAsset] = input.symbol.split("_") as [string, string];
     const book = this.book(input.symbol);
 
     // Step 1: best matching resting order (price-time priority, ONE level).
